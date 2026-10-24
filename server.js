@@ -496,14 +496,148 @@ app.use((err, _req, res, _next) => {
   const status = Number(err.status) || 500;
   res.status(status).json({ error: status < 500 ? err.message : 'Server error' });
 });
-pool.query('ALTER TABLE users ADD COLUMN IF NOT EXISTS password_hash TEXT')
-  .then(() => pool.query("ALTER TABLE users ADD COLUMN IF NOT EXISTS vendor_verification TEXT NOT NULL DEFAULT 'not_submitted'"))
-  .then(() => pool.query('ALTER TABLE driver_documents ADD COLUMN IF NOT EXISTS encrypted_payload TEXT'))
-  .then(() => pool.query('ALTER TABLE driver_documents DROP CONSTRAINT IF EXISTS driver_documents_document_type_check'))
-  .then(() => pool.query("ALTER TABLE driver_documents ADD CONSTRAINT driver_documents_document_type_check CHECK (document_type IN ('aadhaar','vendor_aadhaar','driving_licence','vehicle_rc','vendor_gst','vendor_pan'))"))
-  .then(() => app.listen(port, () => console.log(`Gudiya Taxi Partner API listening on ${port}`)))
-  .catch(e => {
-  console.error('Database migration failed:', e);
-  console.error('Error details:', e?.stack);
-  process.exit(1);
-});
+// Create database tables before running migrations.
+async function initializeDatabase() {
+  await pool.query(`
+    CREATE TABLE IF NOT EXISTS users (
+      id BIGSERIAL PRIMARY KEY,
+      phone TEXT UNIQUE,
+      name TEXT,
+      role_mode TEXT NOT NULL DEFAULT 'both',
+      driver_verification TEXT NOT NULL DEFAULT 'not_submitted',
+      vendor_verification TEXT NOT NULL DEFAULT 'not_submitted',
+      password_hash TEXT,
+      created_at TIMESTAMPTZ NOT NULL DEFAULT now(),
+      updated_at TIMESTAMPTZ NOT NULL DEFAULT now()
+    )
+  `);
+
+  await pool.query(`
+    CREATE TABLE IF NOT EXISTS device_sessions (
+      id TEXT PRIMARY KEY,
+      user_id BIGINT NOT NULL REFERENCES users(id) ON DELETE CASCADE,
+      device_id TEXT NOT NULL,
+      revoked_at TIMESTAMPTZ,
+      last_seen_at TIMESTAMPTZ,
+      created_at TIMESTAMPTZ NOT NULL DEFAULT now()
+    )
+  `);
+
+  await pool.query(`
+    CREATE TABLE IF NOT EXISTS driver_documents (
+      id BIGSERIAL PRIMARY KEY,
+      user_id BIGINT NOT NULL REFERENCES users(id) ON DELETE CASCADE,
+      document_type TEXT NOT NULL,
+      secure_object_key TEXT NOT NULL,
+      status TEXT NOT NULL DEFAULT 'pending',
+      encrypted_payload TEXT,
+      reviewer_note TEXT,
+      created_at TIMESTAMPTZ NOT NULL DEFAULT now(),
+      reviewed_at TIMESTAMPTZ,
+      UNIQUE(user_id, document_type)
+    )
+  `);
+
+  await pool.query(`
+    CREATE TABLE IF NOT EXISTS duties (
+      id BIGSERIAL PRIMARY KEY,
+      user_id BIGINT NOT NULL REFERENCES users(id) ON DELETE CASCADE,
+      role_posted_as TEXT NOT NULL,
+      pickup_city TEXT NOT NULL,
+      pickup_address_private TEXT,
+      drop_city TEXT NOT NULL,
+      drop_address_private TEXT,
+      vehicle_type TEXT NOT NULL,
+      duty_date DATE,
+      duty_time TIME,
+      payout_paise BIGINT,
+      notes_private TEXT,
+      distance_km NUMERIC,
+      distance_label TEXT NOT NULL DEFAULT 'लगभग दूरी',
+      created_at TIMESTAMPTZ NOT NULL DEFAULT now(),
+      status TEXT NOT NULL DEFAULT 'open',
+      accepted_by_user_id BIGINT REFERENCES users(id)
+    )
+  `);
+
+  await pool.query(`
+    CREATE TABLE IF NOT EXISTS subscriptions (
+      id BIGSERIAL PRIMARY KEY,
+      user_id BIGINT NOT NULL REFERENCES users(id) ON DELETE CASCADE,
+      provider_subscription_id TEXT UNIQUE,
+      provider_payment_id TEXT,
+      plan_months INTEGER NOT NULL,
+      amount_rupees INTEGER NOT NULL,
+      status TEXT NOT NULL DEFAULT 'created',
+      current_period_end TIMESTAMPTZ,
+      created_at TIMESTAMPTZ NOT NULL DEFAULT now(),
+      updated_at TIMESTAMPTZ NOT NULL DEFAULT now()
+    )
+  `);
+
+  await pool.query(`
+    CREATE TABLE IF NOT EXISTS webhook_events (
+      event_id TEXT PRIMARY KEY,
+      event_type TEXT NOT NULL,
+      created_at TIMESTAMPTZ NOT NULL DEFAULT now()
+    )
+  `);
+
+  await pool.query(`
+    CREATE TABLE IF NOT EXISTS audit_log (
+      id BIGSERIAL PRIMARY KEY,
+      action TEXT NOT NULL,
+      subject_type TEXT NOT NULL,
+      subject_id TEXT NOT NULL,
+      details JSONB NOT NULL DEFAULT '{}'::jsonb,
+      created_at TIMESTAMPTZ NOT NULL DEFAULT now()
+    )
+  `);
+
+  await pool.query(
+    'ALTER TABLE users ADD COLUMN IF NOT EXISTS password_hash TEXT'
+  );
+
+  await pool.query(`
+    ALTER TABLE users
+    ADD COLUMN IF NOT EXISTS vendor_verification
+    TEXT NOT NULL DEFAULT 'not_submitted'
+  `);
+
+  await pool.query(`
+    ALTER TABLE driver_documents
+    ADD COLUMN IF NOT EXISTS encrypted_payload TEXT
+  `);
+
+  await pool.query(`
+    ALTER TABLE driver_documents
+    DROP CONSTRAINT IF EXISTS driver_documents_document_type_check
+  `);
+
+  await pool.query(`
+    ALTER TABLE driver_documents
+    ADD CONSTRAINT driver_documents_document_type_check
+    CHECK (document_type IN (
+      'aadhaar',
+      'vendor_aadhaar',
+      'driving_licence',
+      'vehicle_rc',
+      'vendor_gst',
+      'vendor_pan'
+    ))
+  `);
+}
+
+initializeDatabase()
+  .then(() => {
+    app.listen(port, () =>
+      console.log(
+        `Gudiya Taxi Partner API listening on ${port}`
+      )
+    );
+  })
+  .catch(error => {
+    console.error('Database initialization/migration failed:', error);
+    console.error('Error details:', error?.stack);
+    process.exit(1);
+  });
