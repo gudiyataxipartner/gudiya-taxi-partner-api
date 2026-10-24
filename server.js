@@ -502,4 +502,8 @@ pool.query('ALTER TABLE users ADD COLUMN IF NOT EXISTS password_hash TEXT')
   .then(() => pool.query('ALTER TABLE driver_documents DROP CONSTRAINT IF EXISTS driver_documents_document_type_check'))
   .then(() => pool.query("ALTER TABLE driver_documents ADD CONSTRAINT driver_documents_document_type_check CHECK (document_type IN ('aadhaar','vendor_aadhaar','driving_licence','vehicle_rc','vendor_gst','vendor_pan'))"))
   .then(() => app.listen(port, () => console.log(`Gudiya Taxi Partner API listening on ${port}`)))
-  .catch(e => { console.error('Database migration failed:', e.message); process.exit(1); });
+  .catch(e => {
+  console.error('Database migration failed:', e);
+  console.error('Error details:', e?.stack);
+  process.exit(1);
+});
