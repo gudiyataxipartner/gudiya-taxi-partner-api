@@ -36,7 +36,7 @@ CREATE TABLE IF NOT EXISTS duties (
   distance_km NUMERIC(8,1),
   distance_label TEXT NOT NULL DEFAULT 'लगभग दूरी',
   created_at TIMESTAMPTZ NOT NULL DEFAULT now(),
-  status TEXT NOT NULL DEFAULT 'open' CHECK (status IN ('open','accepted','completed','cancelled'))
+  status TEXT NOT NULL DEFAULT 'open' CHECK (status IN ('open','accepted','completed','cancelled','booked'))
 );
 CREATE INDEX IF NOT EXISTS duties_open_created ON duties(status, created_at DESC);
 CREATE TABLE IF NOT EXISTS subscriptions (
@@ -95,3 +95,9 @@ ALTER TABLE duties ADD COLUMN IF NOT EXISTS duty_time TIME;
 ALTER TABLE subscriptions ADD COLUMN IF NOT EXISTS plan_months INTEGER;
 ALTER TABLE subscriptions ADD COLUMN IF NOT EXISTS amount_rupees INTEGER;
 CREATE INDEX IF NOT EXISTS duties_accepted_by_user ON duties(accepted_by_user_id) WHERE accepted_by_user_id IS NOT NULL;
+
+-- Allow the duty poster to mark a duty as booked.
+-- Drop/recreate the existing CHECK constraint so this also updates an existing database.
+ALTER TABLE duties DROP CONSTRAINT IF EXISTS duties_status_check;
+ALTER TABLE duties ADD CONSTRAINT duties_status_check
+  CHECK (status IN ('open','accepted','completed','cancelled','booked'));
