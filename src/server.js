@@ -9,8 +9,8 @@ const fs = require("fs");
 const path = require("path");
 const { Pool } = require("pg");
 const Razorpay = require("razorpay");
-const twilio = require("twilio");
 const bcrypt = require("bcryptjs");
+const firebaseAdmin = require("firebase-admin");
 
 const app = express();
 const dutyEventClients = new Set();
@@ -37,10 +37,73 @@ const razorpay =
         key_secret: process.env.RAZORPAY_KEY_SECRET,
       })
     : null;
-const twilioClient =
-  process.env.TWILIO_ACCOUNT_SID && process.env.TWILIO_AUTH_TOKEN
-    ? twilio(process.env.TWILIO_ACCOUNT_SID, process.env.TWILIO_AUTH_TOKEN)
-    : null;
+
+// Firebase Admin credentials must be stored as a Render secret, never committed to GitHub.
+// Set FIREBASE_SERVICE_ACCOUNT_JSON to the complete service-account JSON string.
+let firebaseMessaging = null;
+try {
+  if (process.env.FIREBASE_SERVICE_ACCOUNT_JSON) {
+    const serviceAccount = JSON.parse(
+      process.env.FIREBASE_SERVICE_ACCOUNT_JSON
+    );
+    if (!firebaseAdmin.apps.length) {
+      firebaseAdmin.initializeApp({
+        credential: firebaseAdmin.credential.cert(serviceAccount),
+      });
+    }
+    firebaseMessaging = firebaseAdmin.messaging();
+  }
+} catch (error) {
+  console.error(
+    "Firebase Admin is not configured; push notifications are disabled:",
+    error.message
+  );
+}
+
+async function sendPushToUserIds(userIds, title, body, extraData = {}) {
+  if (!firebaseMessaging || !Array.isArray(userIds) || !userIds.length) return;
+  try {
+    const ids = [...new Set(userIds.map(String))];
+    const found = await pool.query(
+      "SELECT token FROM push_tokens WHERE user_id = ANY($1::bigint[])",
+      [ids]
+    );
+    const tokens = found.rows.map((row) => row.token).filter(Boolean);
+    for (let i = 0; i < tokens.length; i += 500) {
+      const batch = tokens.slice(i, i + 500);
+      const data = Object.fromEntries(
+        Object.entries({
+          title,
+          body,
+          ...extraData,
+        }).map(([key, value]) => [key, String(value ?? "")])
+      );
+      const result = await firebaseMessaging.sendEachForMulticast({
+        tokens: batch,
+        data,
+        android: { priority: "high" },
+      });
+      const invalid = [];
+      result.responses.forEach((response, index) => {
+        if (
+          !response.success &&
+          [
+            "messaging/registration-token-not-registered",
+            "messaging/invalid-registration-token",
+          ].includes(response.error?.code)
+        )
+          invalid.push(batch[index]);
+      });
+      if (invalid.length)
+        await pool.query(
+          "DELETE FROM push_tokens WHERE token = ANY($1::text[])",
+          [invalid]
+        );
+    }
+  } catch (error) {
+    console.error("Push notification send failed:", error.message);
+  }
+}
 
 app.disable("x-powered-by");
 app.use(helmet());
@@ -60,185 +123,90 @@ app.use(
     },
   })
 );
-// Razorpay signature verification must use the exact raw request body.
-// Keep this route before express.json() so the signature is checked correctly.
+// Razorpay signature needs the exact raw request body. Parse JSON only after webhook route.
 app.post(
   "/api/payments/razorpay-webhook",
   express.raw({ type: "application/json", limit: "1mb" }),
   async (req, res) => {
     const secret = process.env.RAZORPAY_WEBHOOK_SECRET;
     const signature = req.get("x-razorpay-signature");
-    if (!secret || !signature || !Buffer.isBuffer(req.body)) {
+    if (!secret || !signature || !Buffer.isBuffer(req.body))
       return res.status(400).send("Webhook not configured");
-    }
-
     try {
       const expected = crypto
         .createHmac("sha256", secret)
         .update(req.body)
         .digest("hex");
-      const expectedBuffer = Buffer.from(expected, "utf8");
-      const signatureBuffer = Buffer.from(signature, "utf8");
-      if (
-        expectedBuffer.length !== signatureBuffer.length ||
-        !crypto.timingSafeEqual(expectedBuffer, signatureBuffer)
-      ) {
+      const a = Buffer.from(expected, "utf8"),
+        b = Buffer.from(signature, "utf8");
+      if (a.length !== b.length || !crypto.timingSafeEqual(a, b))
         return res.status(400).send("Invalid signature");
-      }
-
       const event = JSON.parse(req.body.toString("utf8"));
       const eventId =
         req.get("x-razorpay-event-id") ||
         crypto.createHash("sha256").update(req.body).digest("hex");
-      const eventType = String(event.event || "unknown");
-      const sub = event.payload?.subscription?.entity;
-      const payment = event.payload?.payment?.entity;
-      const subscriptionId = sub?.id || payment?.subscription_id || null;
-
       const client = await pool.connect();
       try {
         await client.query("BEGIN");
         const inserted = await client.query(
-          `INSERT INTO webhook_events(event_id,event_type)
-           VALUES($1,$2) ON CONFLICT DO NOTHING RETURNING event_id`,
-          [eventId, eventType]
+          "INSERT INTO webhook_events(event_id,event_type) VALUES($1,$2) ON CONFLICT DO NOTHING RETURNING event_id",
+          [eventId, event.event || "unknown"]
         );
-
         if (!inserted.rowCount) {
           await client.query("COMMIT");
           return res.status(200).json({ received: true, duplicate: true });
         }
-
+        const sub = event.payload?.subscription?.entity;
+        const payment = event.payload?.payment?.entity;
+        const subscriptionId = sub?.id || payment?.subscription_id;
         if (subscriptionId) {
-          const providerEnd = Number.isFinite(Number(sub?.current_end))
-            ? Number(sub.current_end)
-            : null;
-          const paymentConfirmed =
-            eventType === "subscription.charged" ||
-            payment?.status === "captured" ||
-            Number(sub?.paid_count || 0) > 0;
-
-          if (eventType === "subscription.charged") {
-            // Prefer Razorpay's billing-cycle end. The plan_months fallback is
-            // used only if the webhook did not include a usable future end time.
-            await client.query(
-              `UPDATE subscriptions
-               SET status='active',
-                   provider_payment_id=COALESCE($1, provider_payment_id),
-                   current_period_end=CASE
-                     WHEN $2::bigint IS NOT NULL
-                       AND to_timestamp($2::bigint) > now()
-                     THEN to_timestamp($2::bigint)
-                     ELSE now() + (COALESCE(plan_months,1)::text || ' months')::interval
-                   END,
-                   updated_at=now()
-               WHERE provider_subscription_id=$3`,
-              [payment?.id || null, providerEnd, subscriptionId]
-            );
-          } else if (eventType === "subscription.activated") {
-            // Do not grant membership on activation alone unless Razorpay's
-            // payload confirms a successful charge (paid_count or captured payment).
-            await client.query(
-              `UPDATE subscriptions
-               SET status=CASE
-                     WHEN $1::boolean THEN 'active'
-                     WHEN status='active' AND current_period_end > now() THEN 'active'
-                     ELSE 'authenticated'
-                   END,
-                   current_period_end=CASE
-                     WHEN $1::boolean AND $2::bigint IS NOT NULL
-                       AND to_timestamp($2::bigint) > now()
-                     THEN to_timestamp($2::bigint)
-                     WHEN $1::boolean
-                       AND (current_period_end IS NULL OR current_period_end <= now())
-                     THEN now() + (COALESCE(plan_months,1)::text || ' months')::interval
-                     ELSE current_period_end
-                   END,
-                   updated_at=now()
-               WHERE provider_subscription_id=$3`,
-              [paymentConfirmed, providerEnd, subscriptionId]
-            );
-          } else if (eventType === "subscription.authenticated") {
-            await client.query(
-              `UPDATE subscriptions
-               SET status=CASE
-                     WHEN status='active' AND current_period_end > now() THEN 'active'
-                     ELSE 'authenticated'
-                   END,
-                   updated_at=now()
-               WHERE provider_subscription_id=$1`,
-              [subscriptionId]
-            );
-          } else if (eventType === "subscription.resumed") {
-            await client.query(
-              `UPDATE subscriptions
-               SET status=CASE
-                     WHEN $1::boolean AND (
-                       ($2::bigint IS NOT NULL AND to_timestamp($2::bigint) > now())
-                       OR current_period_end > now()
-                     ) THEN 'active'
-                     WHEN current_period_end > now() THEN 'active'
-                     ELSE 'authenticated'
-                   END,
-                   current_period_end=CASE
-                     WHEN $2::bigint IS NOT NULL
-                       AND to_timestamp($2::bigint) > now()
-                     THEN to_timestamp($2::bigint)
-                     ELSE current_period_end
-                   END,
-                   updated_at=now()
-               WHERE provider_subscription_id=$3`,
-              [paymentConfirmed, providerEnd, subscriptionId]
-            );
-          } else if (
-            ["subscription.halted", "subscription.paused"].includes(eventType)
+          if (
+            ["subscription.activated", "subscription.authenticated"].includes(
+              event.event
+            )
           ) {
-            // Preserve access already paid for until its current period ends.
             await client.query(
-              `UPDATE subscriptions
-               SET status=CASE
-                     WHEN current_period_end > now() THEN 'active'
-                     ELSE 'halted'
-                   END,
-                   updated_at=now()
-               WHERE provider_subscription_id=$1`,
-              [subscriptionId]
+              `UPDATE subscriptions SET status=$1, current_period_end=CASE WHEN $3::bigint IS NOT NULL THEN to_timestamp($3::bigint) ELSE COALESCE(current_period_end, now() + (plan_months || ' months')::interval) END, updated_at=now()
+            WHERE provider_subscription_id=$2`,
+              [
+                event.event === "subscription.activated"
+                  ? "active"
+                  : "authenticated",
+                subscriptionId,
+                sub?.current_end || null,
+              ]
+            );
+          } else if (event.event === "subscription.charged") {
+            await client.query(
+              `UPDATE subscriptions SET status='active', provider_payment_id=$1,
+            current_period_end=now() + (COALESCE(plan_months,1)::text || ' months')::interval, updated_at=now()
+            WHERE provider_subscription_id=$2`,
+              [payment?.id || null, subscriptionId]
             );
           } else if (
             [
+              "subscription.halted",
               "subscription.cancelled",
               "subscription.completed",
-              "subscription.expired",
-            ].includes(eventType)
+            ].includes(event.event)
           ) {
-            const terminalState =
-              eventType === "subscription.cancelled" ? "cancelled" : "expired";
-            // Cancellation should not remove access for a period that was already paid.
+            const state =
+              event.event === "subscription.cancelled" ||
+              event.event === "subscription.completed"
+                ? "cancelled"
+                : "halted";
             await client.query(
-              `UPDATE subscriptions
-               SET status=CASE
-                     WHEN current_period_end > now() THEN 'active'
-                     ELSE $1
-                   END,
-                   updated_at=now()
-               WHERE provider_subscription_id=$2`,
-              [terminalState, subscriptionId]
+              "UPDATE subscriptions SET status=$1, updated_at=now() WHERE provider_subscription_id=$2",
+              [state, subscriptionId]
             );
-          } else if (eventType === "payment.failed") {
-            // A failed renewal must not remove access from an already-paid period.
+          } else if (event.event === "payment.failed") {
             await client.query(
-              `UPDATE subscriptions
-               SET status=CASE
-                     WHEN current_period_end > now() THEN 'active'
-                     ELSE 'failed'
-                   END,
-                   updated_at=now()
-               WHERE provider_subscription_id=$1`,
+              `UPDATE subscriptions SET status='failed', updated_at=now()
+            WHERE provider_subscription_id=$1 AND status <> 'active'`,
               [subscriptionId]
             );
           }
         }
-
         await client.query("COMMIT");
         return res.status(200).json({ received: true });
       } catch (e) {
@@ -253,7 +221,6 @@ app.post(
     }
   }
 );
-
 app.use(express.json({ limit: "25mb" }));
 app.use(
   rateLimit({
@@ -416,9 +383,11 @@ app.post(
         );
         if (existing.rowCount) {
           await client.query("ROLLBACK");
-          return res.status(409).json({
-            error: "इस मोबाइल नंबर का अकाउंट पहले से है। लॉगिन करें।",
-          });
+          return res
+            .status(409)
+            .json({
+              error: "इस मोबाइल नंबर का अकाउंट पहले से है। लॉगिन करें।",
+            });
         }
         const created = await client.query(
           `INSERT INTO users(phone,name,role_mode,password_hash) VALUES($1,$2,$3,$4)
@@ -488,6 +457,9 @@ app.post(
           "UPDATE device_sessions SET revoked_at=now() WHERE user_id=$1 AND revoked_at IS NULL",
           [user.id]
         );
+        await client.query("DELETE FROM push_tokens WHERE user_id=$1", [
+          user.id,
+        ]);
         const sid = crypto.randomUUID();
         await client.query(
           "INSERT INTO device_sessions(id,user_id,device_id) VALUES($1,$2,$3)",
@@ -512,86 +484,6 @@ app.post(
   }
 );
 
-// OTP send: Twilio Verify service required. Never returns a static or predictable OTP.
-app.post(
-  "/api/auth/otp/send",
-  rateLimit({ windowMs: 10 * 60_000, limit: 5 }),
-  async (req, res, next) => {
-    try {
-      const phone = normalizePhone(req.body.phone);
-      if (!twilioClient || !process.env.TWILIO_VERIFY_SERVICE_SID)
-        return res
-          .status(503)
-          .json({ error: "OTP provider is not configured yet" });
-      await twilioClient.verify.v2
-        .services(process.env.TWILIO_VERIFY_SERVICE_SID)
-        .verifications.create({ to: "+91" + phone, channel: "sms" });
-      res.json({ sent: true, message: "OTP भेज दिया गया है" });
-    } catch (e) {
-      next(e);
-    }
-  }
-);
-app.post(
-  "/api/auth/otp/verify",
-  rateLimit({ windowMs: 10 * 60_000, limit: 8 }),
-  async (req, res, next) => {
-    try {
-      const phone = normalizePhone(req.body.phone),
-        code = String(req.body.code || "").trim();
-      const deviceId = String(req.body.deviceId || "").trim();
-      if (
-        !/^\d{4,8}$/.test(code) ||
-        deviceId.length < 8 ||
-        deviceId.length > 200
-      )
-        return res.status(400).json({ error: "OTP और device ID सही भरें" });
-      if (!twilioClient || !process.env.TWILIO_VERIFY_SERVICE_SID)
-        return res
-          .status(503)
-          .json({ error: "OTP provider is not configured yet" });
-      const check = await twilioClient.verify.v2
-        .services(process.env.TWILIO_VERIFY_SERVICE_SID)
-        .verificationChecks.create({ to: "+91" + phone, code });
-      if (check.status !== "approved")
-        return res.status(401).json({ error: "OTP गलत या समाप्त हो गया है" });
-      requireConfig();
-      const client = await pool.connect();
-      try {
-        await client.query("BEGIN");
-        const u = await client.query(
-          `INSERT INTO users(phone) VALUES($1) ON CONFLICT(phone) DO UPDATE SET updated_at=now()
-        RETURNING id, phone, name, role_mode, driver_verification`,
-          [phone]
-        );
-        const user = u.rows[0];
-        await client.query(
-          "UPDATE device_sessions SET revoked_at=now() WHERE user_id=$1 AND revoked_at IS NULL",
-          [user.id]
-        );
-        const sid = crypto.randomUUID();
-        await client.query(
-          "INSERT INTO device_sessions(id,user_id,device_id) VALUES($1,$2,$3)",
-          [sid, user.id, deviceId]
-        );
-        await client.query("COMMIT");
-        const token = jwt.sign(
-          { sub: String(user.id), sid },
-          process.env.JWT_SECRET,
-          { expiresIn: "30d", issuer: "gudiya-taxi-partner-api" }
-        );
-        res.json({ token, user, sessionPolicy: "one-active-device" });
-      } catch (e) {
-        await client.query("ROLLBACK");
-        throw e;
-      } finally {
-        client.release();
-      }
-    } catch (e) {
-      next(e);
-    }
-  }
-);
 app.get("/api/me", requireAuth, (req, res) =>
   res.json({
     user: {
@@ -622,12 +514,33 @@ app.patch("/api/me", requireAuth, async (req, res, next) => {
     next(e);
   }
 });
+app.post("/api/push/register-token", requireAuth, async (req, res, next) => {
+  try {
+    const token = String(req.body.token || "").trim();
+    if (token.length < 20 || token.length > 4096 || /\\s/.test(token)) {
+      return res.status(400).json({ error: "Invalid push token" });
+    }
+    await pool.query(
+      `INSERT INTO push_tokens(token,user_id,created_at,last_seen_at)
+      VALUES($1,$2,now(),now())
+      ON CONFLICT(token) DO UPDATE SET user_id=EXCLUDED.user_id,last_seen_at=now()`,
+      [token, req.auth.user_id]
+    );
+    return res.json({ ok: true, registered: true });
+  } catch (e) {
+    next(e);
+  }
+});
+
 app.post("/api/auth/logout", requireAuth, async (req, res, next) => {
   try {
     await pool.query(
       "UPDATE device_sessions SET revoked_at=now() WHERE id=$1",
       [req.auth.id]
     );
+    await pool.query("DELETE FROM push_tokens WHERE user_id=$1", [
+      req.auth.user_id,
+    ]);
     res.json({ ok: true });
   } catch (e) {
     next(e);
@@ -692,10 +605,12 @@ app.post("/api/driver-verification", requireAuth, async (req, res, next) => {
         .status(403)
         .json({ error: "इस अकाउंट में वेंडर भूमिका नहीं है" });
     if (category === "both" && role !== "both")
-      return res.status(403).json({
-        error:
-          "सभी दस्तावेज़ों के लिए ड्राइवर और वेंडर दोनों भूमिका वाला अकाउंट जरूरी है",
-      });
+      return res
+        .status(403)
+        .json({
+          error:
+            "सभी दस्तावेज़ों के लिए ड्राइवर और वेंडर दोनों भूमिका वाला अकाउंट जरूरी है",
+        });
     if (!["driver", "vendor", "both"].includes(category))
       return res.status(400).json({ error: "सत्यापन का प्रकार सही नहीं है" });
     const docs = Array.isArray(req.body.documents) ? req.body.documents : [];
@@ -752,10 +667,12 @@ app.post("/api/driver-verification", requireAuth, async (req, res, next) => {
         !seen.has("driving_licence") ||
         !seen.has("vehicle_rc"))
     )
-      return res.status(400).json({
-        error:
-          "ड्राइवर के लिए Aadhaar, ड्राइविंग लाइसेंस और वाहन RC तीनों जमा करना जरूरी है",
-      });
+      return res
+        .status(400)
+        .json({
+          error:
+            "ड्राइवर के लिए Aadhaar, ड्राइविंग लाइसेंस और वाहन RC तीनों जमा करना जरूरी है",
+        });
     if (category === "vendor" && !seen.has("vendor_aadhaar"))
       return res
         .status(400)
@@ -767,10 +684,12 @@ app.post("/api/driver-verification", requireAuth, async (req, res, next) => {
         !seen.has("vehicle_rc") ||
         !seen.has("vendor_aadhaar"))
     )
-      return res.status(400).json({
-        error:
-          "ड्राइवर + वेंडर के लिए दोनों Aadhaar, ड्राइविंग लाइसेंस और वाहन RC जमा करना जरूरी है",
-      });
+      return res
+        .status(400)
+        .json({
+          error:
+            "ड्राइवर + वेंडर के लिए दोनों Aadhaar, ड्राइविंग लाइसेंस और वाहन RC जमा करना जरूरी है",
+        });
     const client = await pool.connect();
     try {
       await client.query("BEGIN");
@@ -808,12 +727,14 @@ app.post("/api/driver-verification", requireAuth, async (req, res, next) => {
         ]
       );
       await client.query("COMMIT");
-      return res.status(201).json({
-        ok: true,
-        category,
-        verification: "pending",
-        message: "दस्तावेज़ सुरक्षित रूप से जमा हुए; प्रशासनिक जाँच बाकी है।",
-      });
+      return res
+        .status(201)
+        .json({
+          ok: true,
+          category,
+          verification: "pending",
+          message: "दस्तावेज़ सुरक्षित रूप से जमा हुए; प्रशासनिक जाँच बाकी है।",
+        });
     } catch (e) {
       await client.query("ROLLBACK").catch(() => {});
       throw e;
@@ -896,6 +817,23 @@ app.post("/api/duties", requireAuth, async (req, res, next) => {
       ]
     );
     broadcastDutyUpdate();
+    const targetRole = role === "vendor" ? "driver" : "vendor";
+    pool
+      .query(
+        "SELECT id FROM users WHERE id<>$1 AND (role_mode=$2 OR role_mode='both')",
+        [req.auth.user_id, targetRole]
+      )
+      .then((rows) =>
+        sendPushToUserIds(
+          rows.rows.map((row) => row.id),
+          "नई ड्यूटी उपलब्ध है",
+          `${pickup} से ${drop} के लिए नई ड्यूटी पोस्ट हुई है।`,
+          { type: "new_duty", dutyId: r.rows[0].id }
+        )
+      )
+      .catch((error) =>
+        console.error("Could not find push recipients:", error.message)
+      );
     res.status(201).json({ duty: r.rows[0] });
   } catch (e) {
     next(e);
@@ -924,12 +862,19 @@ app.get("/api/duties", requireAuth, async (req, res, next) => {
         0,
         Math.ceil((5 * 60 * 1000 - ageMs) / 1000)
       );
-      // Subscribers see full details immediately. Non-subscribers see basic duty info for the first five minutes; full details unlock after five minutes.
-      const detailsAvailable = active || secondsRemaining === 0;
+      // The person who posted a duty always sees its full details, regardless of membership.
+      // Other subscribers see full details immediately; other non-subscribers unlock them after five minutes.
+      // Compare IDs as strings too, so the duty poster is never locked by a boolean/type mismatch.
+      const isOwner =
+        d.is_owner === true || String(d.user_id) === String(req.auth.user_id);
+      const detailsAvailable = isOwner || active || secondsRemaining === 0;
       const basic = {
         ...privateDuty(d),
-        freeWindowSecondsRemaining: active ? null : secondsRemaining,
-        membershipRequiredAfterFreeWindow: !active && secondsRemaining === 0,
+        isOwner,
+        detailsAvailable,
+        freeWindowSecondsRemaining: isOwner || active ? null : secondsRemaining,
+        membershipRequiredAfterFreeWindow:
+          !isOwner && !active && secondsRemaining === 0,
       };
       if (detailsAvailable)
         return {
@@ -948,7 +893,7 @@ app.get("/api/duties", requireAuth, async (req, res, next) => {
       duties,
       membershipActive: active,
       privateDetailsRule:
-        "subscribers see full details immediately; non-subscribers see full details after the first 5 minutes",
+        "duty owner always sees full details; subscribers see full details immediately; other non-subscribers see full details after the first 5 minutes",
     });
   } catch (e) {
     next(e);
@@ -959,7 +904,7 @@ app.get("/api/duties", requireAuth, async (req, res, next) => {
 app.post("/api/duties/:id/accept", requireAuth, async (req, res, next) => {
   try {
     const id = String(req.params.id || "");
-    if (!/^\\d+$/.test(id))
+    if (!/^\d+$/.test(id))
       return res.status(400).json({ error: "ड्यूटी ID सही नहीं है" });
     if (!["driver", "both"].includes(req.auth.role_mode))
       return res
@@ -985,9 +930,11 @@ app.post("/api/duties/:id/accept", requireAuth, async (req, res, next) => {
       }
       if (duty.status !== "open") {
         await client.query("ROLLBACK");
-        return res.status(409).json({
-          error: "यह ड्यूटी पहले ही स्वीकार हो चुकी है या उपलब्ध नहीं है",
-        });
+        return res
+          .status(409)
+          .json({
+            error: "यह ड्यूटी पहले ही स्वीकार हो चुकी है या उपलब्ध नहीं है",
+          });
       }
       const updated = await client.query(
         `UPDATE duties SET status='accepted', accepted_by_user_id=$2
@@ -1002,6 +949,12 @@ app.post("/api/duties/:id/accept", requireAuth, async (req, res, next) => {
       }
       await client.query("COMMIT");
       broadcastDutyUpdate();
+      void sendPushToUserIds(
+        [duty.user_id],
+        "ड्यूटी स्वीकार हुई",
+        `${updated.rows[0].pickup_city} से ${updated.rows[0].drop_city} की ड्यूटी स्वीकार कर ली गई है।`,
+        { type: "duty_accepted", dutyId: updated.rows[0].id }
+      );
       return res.json({
         duty: updated.rows[0],
         message: "ड्यूटी सफलतापूर्वक स्वीकार हो गई",
@@ -1012,6 +965,50 @@ app.post("/api/duties/:id/accept", requireAuth, async (req, res, next) => {
     } finally {
       client.release();
     }
+  } catch (e) {
+    next(e);
+  }
+});
+// Only the user who posted the duty can mark it booked. This also supports bookings confirmed by phone/WhatsApp while status is still open.
+app.post("/api/duties/:id/booked", requireAuth, async (req, res, next) => {
+  try {
+    const id = String(req.params.id || "");
+    if (!/^\d+$/.test(id))
+      return res.status(400).json({ error: "ड्यूटी ID सही नहीं है" });
+    const r = await pool.query(
+      `UPDATE duties SET status='booked'
+      WHERE id=$1 AND user_id=$2 AND status IN ('open','accepted')
+      RETURNING id,pickup_city,drop_city,status,accepted_by_user_id`,
+      [id, req.auth.user_id]
+    );
+    if (!r.rowCount) {
+      const existing = await pool.query(
+        "SELECT user_id,status FROM duties WHERE id=$1",
+        [id]
+      );
+      if (!existing.rowCount)
+        return res.status(404).json({ error: "ड्यूटी नहीं मिली" });
+      if (String(existing.rows[0].user_id) !== String(req.auth.user_id))
+        return res
+          .status(403)
+          .json({ error: "केवल ड्यूटी डालने वाला ही DUTY BOOKED कर सकता है" });
+      return res
+        .status(409)
+        .json({ error: "यह ड्यूटी पहले ही बुक, पूरी या रद्द हो चुकी है" });
+    }
+    broadcastDutyUpdate();
+    if (r.rows[0].accepted_by_user_id) {
+      void sendPushToUserIds(
+        [r.rows[0].accepted_by_user_id],
+        "DUTY BOOKED",
+        `${r.rows[0].pickup_city} से ${r.rows[0].drop_city} की ड्यूटी बुक कन्फर्म हो गई है।`,
+        { type: "duty_booked", dutyId: r.rows[0].id }
+      );
+    }
+    return res.json({
+      duty: r.rows[0],
+      message: "ड्यूटी का स्टेटस DUTY BOOKED कर दिया गया।",
+    });
   } catch (e) {
     next(e);
   }
@@ -1045,7 +1042,8 @@ app.get("/api/duties/accepted", requireAuth, async (req, res, next) => {
 app.get("/api/duties/mine", requireAuth, async (req, res, next) => {
   try {
     const r = await pool.query(
-      `SELECT id,role_posted_as,pickup_city,pickup_address_private,drop_city,drop_address_private,vehicle_type,duty_date,duty_time,payout_paise,notes_private,distance_km,distance_label,created_at,status
+      `SELECT id,role_posted_as,pickup_city,pickup_address_private,drop_city,drop_address_private,vehicle_type,duty_date,duty_time,payout_paise,notes_private,distance_km,distance_label,created_at,status,
+      (user_id=$1) AS is_owner
       FROM duties WHERE user_id=$1 ORDER BY created_at DESC LIMIT 100`,
       [req.auth.user_id]
     );
@@ -1080,18 +1078,15 @@ app.post("/api/membership/autopay", requireAuth, async (req, res, next) => {
         .status(400)
         .json({ error: "सदस्यता अवधि 1, 3 या 6 महीने चुनें" });
     if (!razorpay || !selected.planId)
-      return res.status(503).json({
-        error:
-          "चुना हुआ सदस्यता प्लान अभी भुगतान सर्वर पर कॉन्फ़िगर नहीं है। अभी कोई पैसा नहीं कटा।",
-      });
+      return res
+        .status(503)
+        .json({
+          error:
+            "चुना हुआ सदस्यता प्लान अभी भुगतान सर्वर पर कॉन्फ़िगर नहीं है। अभी कोई पैसा नहीं कटा।",
+        });
     const existing = await pool.query(
       `SELECT provider_subscription_id,status FROM subscriptions WHERE user_id=$1
-      AND plan_months=$2
-      AND (
-        status IN ('created','authenticated','pending')
-        OR (status='active' AND current_period_end > now())
-      )
-      ORDER BY created_at DESC LIMIT 1`,
+      AND plan_months=$2 AND status IN ('created','authenticated','active','pending') ORDER BY created_at DESC LIMIT 1`,
       [req.auth.user_id, months]
     );
     if (existing.rowCount && existing.rows[0].provider_subscription_id)
@@ -1115,15 +1110,17 @@ app.post("/api/membership/autopay", requireAuth, async (req, res, next) => {
       VALUES($1,$2,$3,$4,'created') ON CONFLICT(provider_subscription_id) DO NOTHING`,
       [req.auth.user_id, created.id, months, selected.amount]
     );
-    res.status(201).json({
-      subscriptionId: created.id,
-      status: created.status,
-      shortUrl: created.short_url || null,
-      planMonths: months,
-      amountRupees: selected.amount,
-      message:
-        "Complete authorization using Razorpay checkout. Membership activates only after a verified payment webhook.",
-    });
+    res
+      .status(201)
+      .json({
+        subscriptionId: created.id,
+        status: created.status,
+        shortUrl: created.short_url || null,
+        planMonths: months,
+        amountRupees: selected.amount,
+        message:
+          "Complete authorization using Razorpay checkout. Membership activates only after a verified payment webhook.",
+      });
   } catch (e) {
     next(e);
   }
@@ -1185,7 +1182,7 @@ app.get(
       res.set(
         "Content-Disposition",
         'attachment; filename="' +
-          String(doc.filename || "document").replace(/[\r\n"\\]/g, "_") + '"' ); res.set("Cache-Control", "no-store"); res.send(bytes); } catch (e) { next(e); } } ); app.post( "/api/admin/documents/:id/review", requireAdmin, async (req, res, next) => { try { const status = String(req.body.status || ""); if (!["approved", "rejected"].includes(status)) return res .status(400) .json({ error: "status must be approved or rejected" }); const client = await pool.connect(); try { await client.query("BEGIN"); const doc = await client.query( `UPDATE driver_documents SET status=$1,reviewer_note=$2,reviewed_at=now() WHERE id=$3 AND status='pending' RETURNING user_id`, [status, String(req.body.note || "").slice(0, 500), req.params.id] ); if (!doc.rowCount) { await client.query("ROLLBACK"); return res.status(404).json({ error: "Pending document not found" }); } const docType = await client.query( "SELECT document_type FROM driver_documents WHERE id=$1", [req.params.id] ); const category = docType.rows[0]?.document_type?.startsWith("vendor_") ? "vendor" : "driver"; const types = category === "vendor" ? ["vendor_aadhaar"] : ["aadhaar", "driving_licence", "vehicle_rc"]; const pending = await client.query( `SELECT count(*)::int AS n FROM driver_documents WHERE user_id=$1 AND document_type = ANY($2::text[]) AND status='pending'`, [doc.rows[0].user_id, types] ); const rejected = await client.query( `SELECT count(*)::int AS n FROM driver_documents WHERE user_id=$1 AND document_type = ANY($2::text[]) AND status='rejected'`, [doc.rows[0].user_id, types] ); const approved = await client.query( `SELECT count(*)::int AS n FROM driver_documents WHERE user_id=$1 AND document_type = ANY($2::text[]) AND status='approved'`, [doc.rows[0].user_id, types] ); let verify = "pending"; if (Number(rejected.rows[0].n) > 0) verify = "rejected"; else if ( Number(pending.rows[0].n) === 0 && Number(approved.rows[0].n) >= (category === "vendor" ? 1 : 3) ) verify = "approved"; const column = category === "vendor" ? "vendor_verification" : "driver_verification"; await client.query( `UPDATE users SET ${column}=$1,updated_at=now() WHERE id=$2`, [verify, doc.rows[0].user_id] ); await client.query( "INSERT INTO audit_log(action,subject_type,subject_id,details) VALUES($1,$2,$3,$4)", [ category + "_document_review", "driver_document", String(req.params.id), JSON.stringify({ status, verify }), ] ); await client.query("COMMIT"); res.json({ ok: true, category, verification: verify }); } catch (e) { await client.query("ROLLBACK"); throw e; } finally { client.release(); } } catch (e) { next(e); } } ); app.use((err, _req, res, _next) => { console.error(err.message); const status = Number(err.status) || 500; res .status(status) .json({ error: status < 500 ? err.message : "Server error" }); }); // Bootstrap the complete schema before accepting requests. This also fixes login's
+          String(doc.filename || "document").replace(/[\r\n"\\]/g, "_") + '"' ); res.set("Cache-Control", "no-store"); res.send(bytes); } catch (e) { next(e); } } ); app.post( "/api/admin/documents/:id/review", requireAdmin, async (req, res, next) => { try { const status = String(req.body.status || ""); if (!["approved", "rejected"].includes(status)) return res .status(400) .json({ error: "status must be approved or rejected" }); const client = await pool.connect(); try { await client.query("BEGIN"); const doc = await client.query( `UPDATE driver_documents SET status=$1,reviewer_note=$2,reviewed_at=now() WHERE id=$3 AND status='pending' RETURNING user_id`, [status, String(req.body.note || "").slice(0, 500), req.params.id] ); if (!doc.rowCount) { await client.query("ROLLBACK"); return res.status(404).json({ error: "Pending document not found" }); } const docType = await client.query( "SELECT document_type FROM driver_documents WHERE id=$1", [req.params.id] ); const category = docType.rows[0]?.document_type?.startsWith("vendor_") ? "vendor" : "driver"; const types = category === "vendor" ? ["vendor_aadhaar"] : ["aadhaar", "driving_licence", "vehicle_rc"]; const pending = await client.query( `SELECT count(*)::int AS n FROM driver_documents WHERE user_id=$1 AND document_type = ANY($2::text[]) AND status='pending'`, [doc.rows[0].user_id, types] ); const rejected = await client.query( `SELECT count(*)::int AS n FROM driver_documents WHERE user_id=$1 AND document_type = ANY($2::text[]) AND status='rejected'`, [doc.rows[0].user_id, types] ); const approved = await client.query( `SELECT count(*)::int AS n FROM driver_documents WHERE user_id=$1 AND document_type = ANY($2::text[]) AND status='approved'`, [doc.rows[0].user_id, types] ); let verify = "pending"; if (Number(rejected.rows[0].n) > 0) verify = "rejected"; else if ( Number(pending.rows[0].n) === 0 && Number(approved.rows[0].n) >= (category === "vendor" ? 1 : 3) ) verify = "approved"; const column = category === "vendor" ? "vendor_verification" : "driver_verification"; await client.query( `UPDATE users SET ${column}=$1,updated_at=now() WHERE id=$2`, [verify, doc.rows[0].user_id] ); await client.query( "INSERT INTO audit_log(action,subject_type,subject_id,details) VALUES($1,$2,$3,$4)", [ category + "_document_review", "driver_document", String(req.params.id), JSON.stringify({ status, verify }), ] ); await client.query("COMMIT"); void sendPushToUserIds( [doc.rows[0].user_id], status === "approved" ? "दस्तावेज़ स्वीकृत हुए" : "दस्तावेज़ में सुधार आवश्यक", status === "approved" ? "आपके दस्तावेज़ स्वीकृत कर दिए गए हैं।" : "आपके दस्तावेज़ अस्वीकृत हुए हैं। कृपया ऐप में स्थिति देखें।", { type: "document_status", status, category } ); res.json({ ok: true, category, verification: verify }); } catch (e) { await client.query("ROLLBACK"); throw e; } finally { client.release(); } } catch (e) { next(e); } } ); app.use((err, _req, res, _next) => { console.error(err.message); const status = Number(err.status) || 500; res .status(status) .json({ error: status < 500 ? err.message : "Server error" }); }); // Bootstrap the complete schema before accepting requests. This also fixes login's
 // generic Server error on a fresh Gudiya database where users/device_sessions did not exist.
 const schemaSql = fs.readFileSync(
   path.join(__dirname, "..", "schema.sql"),
