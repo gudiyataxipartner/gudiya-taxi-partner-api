@@ -160,53 +160,81 @@ app.post(
         const payment = event.payload?.payment?.entity;
         const subscriptionId = sub?.id || payment?.subscription_id;
         if (subscriptionId) {
-          if (
-            ["subscription.activated", "subscription.authenticated"].includes(
-              event.event
-            )
-          ) {
-            await client.query(
-              `UPDATE subscriptions SET status=$1, current_period_end=CASE WHEN $3::bigint IS NOT NULL THEN to_timestamp($3::bigint) ELSE COALESCE(current_period_end, now() + (plan_months || ' months')::interval) END, updated_at=now()
-            WHERE provider_subscription_id=$2`,
-              [
-                event.event === "subscription.activated"
-                  ? "active"
-                  : "authenticated",
-                subscriptionId,
-                sub?.current_end || null,
-              ]
-            );
-          } else if (event.event === "subscription.charged") {
-            await client.query(
-              `UPDATE subscriptions SET status='active', provider_payment_id=$1,
-            current_period_end=now() + (COALESCE(plan_months,1)::text || ' months')::interval, updated_at=now()
-            WHERE provider_subscription_id=$2`,
-              [payment?.id || null, subscriptionId]
-            );
-          } else if (
-            [
-              "subscription.halted",
-              "subscription.cancelled",
-              "subscription.completed",
-            ].includes(event.event)
-          ) {
-            const state =
-              event.event === "subscription.cancelled" ||
-              event.event === "subscription.completed"
-                ? "cancelled"
-                : "halted";
-            await client.query(
-              "UPDATE subscriptions SET status=$1, updated_at=now() WHERE provider_subscription_id=$2",
-              [state, subscriptionId]
-            );
-          } else if (event.event === "payment.failed") {
-            await client.query(
-              `UPDATE subscriptions SET status='failed', updated_at=now()
-            WHERE provider_subscription_id=$1 AND status <> 'active'`,
-              [subscriptionId]
-            );
-          }
-        }
+          
+if (
+  ["subscription.activated", "subscription.authenticated"].includes(
+    event.event
+  )
+) {
+  await client.query(
+    `UPDATE subscriptions
+     SET status = CASE
+       WHEN status = 'active'
+            AND current_period_end > now()
+            AND provider_payment_id IS NOT NULL
+       THEN 'active'
+       ELSE 'authenticated'
+     END,
+     updated_at = now()
+     WHERE provider_subscription_id = $1`,
+    [subscriptionId]
+  );
+} else if (
+  event.event === "subscription.charged" &&
+  payment?.id &&
+  payment?.status === "captured"
+) {
+  await client.query(
+    `UPDATE subscriptions
+     SET status = 'active',
+         provider_payment_id = COALESCE($1, provider_payment_id),
+         current_period_end = CASE
+           WHEN $2::bigint IS NOT NULL
+                AND to_timestamp($2::bigint) > now()
+           THEN to_timestamp($2::bigint)
+           ELSE now() + (COALESCE(plan_months, 1)::text || ' months')::interval
+         END,
+         updated_at = now()
+     WHERE provider_subscription_id = $3`,
+    [payment?.id || null, sub?.current_end || null, subscriptionId]
+  );
+} else if (
+  ["subscription.halted", "subscription.cancelled", "subscription.completed"].includes(
+    event.event
+  )
+) {
+  const state =
+    event.event === "subscription.cancelled" ||
+    event.event === "subscription.completed"
+      ? "cancelled"
+      : "halted";
+
+  await client.query(
+    `UPDATE subscriptions
+     SET status = CASE
+       WHEN current_period_end > now()
+            AND provider_payment_id IS NOT NULL
+       THEN 'active'
+       ELSE $1
+     END,
+     updated_at = now()
+     WHERE provider_subscription_id = $2`,
+    [state, subscriptionId]
+  );
+} else if (event.event === "payment.failed") {
+  await client.query(
+    `UPDATE subscriptions
+     SET status = CASE
+       WHEN current_period_end > now()
+            AND provider_payment_id IS NOT NULL
+       THEN 'active'
+       ELSE 'failed'
+     END,
+     updated_at = now()
+     WHERE provider_subscription_id = $1`,
+    [subscriptionId]
+  );
+}
         await client.query("COMMIT");
         return res.status(200).json({ received: true });
       } catch (e) {
