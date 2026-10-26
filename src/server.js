@@ -349,7 +349,8 @@ function hasActiveMembership(userId) {
   return pool
     .query(
       `SELECT 1 FROM subscriptions WHERE user_id=$1 AND status='active'
-    AND current_period_end > now() ORDER BY current_period_end DESC LIMIT 1`,
+    AND current_period_end > now() AND provider_payment_id IS NOT NULL
+    ORDER BY current_period_end DESC LIMIT 1`,
       [userId]
     )
     .then((r) => !!r.rowCount);
@@ -1144,8 +1145,22 @@ app.post("/api/membership/autopay", requireAuth, async (req, res, next) => {
 app.get("/api/membership", requireAuth, async (req, res, next) => {
   try {
     const r = await pool.query(
-      `SELECT status,current_period_end,created_at,plan_months,amount_rupees FROM subscriptions WHERE user_id=$1
-      ORDER BY created_at DESC LIMIT 1`,
+      `SELECT
+        CASE
+          WHEN status = 'active'
+            AND current_period_end > now()
+            AND provider_payment_id IS NOT NULL THEN 'active'
+          WHEN status = 'active'
+            AND current_period_end <= now() THEN 'expired'
+          WHEN status = 'active'
+            AND provider_payment_id IS NULL THEN 'payment_required'
+          ELSE status
+        END AS status,
+        current_period_end, created_at, plan_months, amount_rupees
+      FROM subscriptions
+      WHERE user_id=$1
+      ORDER BY created_at DESC
+      LIMIT 1`,
       [req.auth.user_id]
     );
     res.json({
