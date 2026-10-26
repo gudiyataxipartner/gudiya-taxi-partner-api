@@ -980,33 +980,27 @@ app.post(
         [req.auth.user_id]
       );
       if (pending.rowCount)
-        return res
-          .status(409)
-          .json({
-            error:
-              "आपका एक भुगतान पहले से जाँच के लिए Pending है। Admin के निर्णय का इंतज़ार करें।",
-          });
+        return res.status(409).json({
+          error:
+            "आपका एक भुगतान पहले से जाँच के लिए Pending है। Admin के निर्णय का इंतज़ार करें।",
+        });
       const created = await pool.query(
         `INSERT INTO membership_payment_requests(user_id,plan_months,amount_rupees,utr)
        VALUES($1,$2,$3,$4) RETURNING id,plan_months,amount_rupees,status,created_at`,
         [req.auth.user_id, months, amount, utr]
       );
-      return res
-        .status(201)
-        .json({
-          ok: true,
-          paymentRequest: created.rows[0],
-          message:
-            "भुगतान संदर्भ जाँच के लिए जमा हो गया है। बैंक में रकम की पुष्टि के बाद ही सदस्यता सक्रिय होगी।",
-        });
+      return res.status(201).json({
+        ok: true,
+        paymentRequest: created.rows[0],
+        message:
+          "भुगतान संदर्भ जाँच के लिए जमा हो गया है। बैंक में रकम की पुष्टि के बाद ही सदस्यता सक्रिय होगी।",
+      });
     } catch (e) {
       if (e.code === "23505")
-        return res
-          .status(409)
-          .json({
-            error:
-              "यह UTR पहले जमा हो चुका है। अपने UPI ऐप से सही Transaction ID जाँचें।",
-          });
+        return res.status(409).json({
+          error:
+            "यह UTR पहले जमा हो चुका है। अपने UPI ऐप से सही Transaction ID जाँचें।",
+        });
       next(e);
     }
   }
@@ -1014,13 +1008,11 @@ app.post(
 
 // UPI AutoPay is disabled. No gateway/recurring charge is initiated by this endpoint.
 app.post("/api/membership/autopay", requireAuth, async (_req, res) => {
-  return res
-    .status(410)
-    .json({
-      error:
-        "UPI AutoPay बंद है। कृपया सामान्य UPI भुगतान करें और Transaction ID जमा करें।",
-      paymentAvailable: true,
-    });
+  return res.status(410).json({
+    error:
+      "UPI AutoPay बंद है। कृपया सामान्य UPI भुगतान करें और Transaction ID जमा करें।",
+    paymentAvailable: true,
+  });
 });
 
 app.get("/api/membership", requireAuth, async (req, res, next) => {
@@ -1327,10 +1319,26 @@ app.get(
         'attachment; filename="' +
           String(doc.filename || "document").replace(/[\r\n"\\]/g, "_") + '"' ); res.set("Cache-Control", "no-store"); res.send(bytes); } catch (e) { next(e); } } ); app.post( "/api/admin/documents/:id/review", requireAdmin, async (req, res, next) => { try { const status = String(req.body.status || ""); if (!["approved", "rejected"].includes(status)) return res .status(400) .json({ error: "status must be approved or rejected" }); const client = await pool.connect(); try { await client.query("BEGIN"); const doc = await client.query( `UPDATE driver_documents SET status=$1,reviewer_note=$2,reviewed_at=now() WHERE id=$3 AND status='pending' RETURNING user_id`, [status, String(req.body.note || "").slice(0, 500), req.params.id] ); if (!doc.rowCount) { await client.query("ROLLBACK"); return res.status(404).json({ error: "Pending document not found" }); } const docType = await client.query( "SELECT document_type FROM driver_documents WHERE id=$1", [req.params.id] ); const category = docType.rows[0]?.document_type?.startsWith("vendor_") ? "vendor" : "driver"; const types = category === "vendor" ? ["vendor_aadhaar"] : ["aadhaar", "driving_licence", "vehicle_rc"]; const pending = await client.query( `SELECT count(*)::int AS n FROM driver_documents WHERE user_id=$1 AND document_type = ANY($2::text[]) AND status='pending'`, [doc.rows[0].user_id, types] ); const rejected = await client.query( `SELECT count(*)::int AS n FROM driver_documents WHERE user_id=$1 AND document_type = ANY($2::text[]) AND status='rejected'`, [doc.rows[0].user_id, types] ); const approved = await client.query( `SELECT count(*)::int AS n FROM driver_documents WHERE user_id=$1 AND document_type = ANY($2::text[]) AND status='approved'`, [doc.rows[0].user_id, types] ); let verify = "pending"; if (Number(rejected.rows[0].n) > 0) verify = "rejected"; else if ( Number(pending.rows[0].n) === 0 && Number(approved.rows[0].n) >= (category === "vendor" ? 1 : 3) ) verify = "approved"; const column = category === "vendor" ? "vendor_verification" : "driver_verification"; await client.query( `UPDATE users SET ${column}=$1,updated_at=now() WHERE id=$2`, [verify, doc.rows[0].user_id] ); await client.query( "INSERT INTO audit_log(action,subject_type,subject_id,details) VALUES($1,$2,$3,$4)", [ category + "_document_review", "driver_document", String(req.params.id), JSON.stringify({ status, verify }), ] ); await client.query("COMMIT"); void sendPushToUserIds( [doc.rows[0].user_id], status === "approved" ? "दस्तावेज़ स्वीकृत हुए" : "दस्तावेज़ में सुधार आवश्यक", status === "approved" ? "आपके दस्तावेज़ स्वीकृत कर दिए गए हैं।" : "आपके दस्तावेज़ अस्वीकृत हुए हैं। कृपया ऐप में स्थिति देखें।", { type: "document_status", status, category } ); res.json({ ok: true, category, verification: verify }); } catch (e) { await client.query("ROLLBACK"); throw e; } finally { client.release(); } } catch (e) { next(e); } } ); app.use((err, _req, res, _next) => { console.error(err.message); const status = Number(err.status) || 500; res .status(status) .json({ error: status < 500 ? err.message : "Server error" }); }); // Bootstrap the complete schema before accepting requests. This also fixes login's
 // generic Server error on a fresh Gudiya database where users/device_sessions did not exist.
-const schemaSql = fs.readFileSync(
+// Resolve schema.sql across the common Render layouts. The API entry point is
+// src/server.js and schema.sql should normally be at the repository root.
+const schemaCandidates = [
+  path.join(__dirname, "schema.sql"),
   path.join(__dirname, "..", "schema.sql"),
-  "utf8"
+  path.join(process.cwd(), "schema.sql"),
+  path.join(process.cwd(), "src", "schema.sql"),
+];
+const schemaPath = schemaCandidates.find((candidate) =>
+  fs.existsSync(candidate)
 );
+if (!schemaPath) {
+  throw new Error(
+    "schema.sql not found. Checked: " +
+      schemaCandidates.join(", ") +
+      ". Ensure schema.sql is committed to the deployed repository root."
+  );
+}
+console.log("Loading database schema from:", schemaPath);
+const schemaSql = fs.readFileSync(schemaPath, "utf8");
 pool
   .query(schemaSql)
   .then(() =>
