@@ -345,15 +345,31 @@ function requireAdmin(req, res, next) {
   }
   next();
 }
-function hasActiveMembership(userId) {
-  return pool
-    .query(
-      `SELECT 1 FROM subscriptions WHERE user_id=$1 AND status='active'
-    AND current_period_end > now() AND provider_payment_id IS NOT NULL
-    ORDER BY current_period_end DESC LIMIT 1`,
-      [userId]
-    )
-    .then((r) => !!r.rowCount);
+async function isCapturedRazorpayPayment(paymentId) {
+  if (!razorpay || !paymentId) return false;
+  try {
+    const payment = await razorpay.payments.fetch(paymentId);
+    return payment?.status === "captured";
+  } catch (error) {
+    console.error(
+      "Could not verify membership payment with Razorpay:",
+      error.message
+    );
+    return false;
+  }
+}
+async function hasActiveMembership(userId) {
+  const r = await pool.query(
+    `SELECT provider_payment_id FROM subscriptions
+     WHERE user_id=$1 AND status='active' AND current_period_end > now()
+       AND provider_payment_id IS NOT NULL
+     ORDER BY current_period_end DESC`,
+    [userId]
+  );
+  for (const row of r.rows) {
+    if (await isCapturedRazorpayPayment(row.provider_payment_id)) return true;
+  }
+  return false;
 }
 function privateDuty(d) {
   return {
@@ -1163,6 +1179,17 @@ app.get("/api/membership", requireAuth, async (req, res, next) => {
       LIMIT 1`,
       [req.auth.user_id]
     );
+    const membershipActive = await hasActiveMembership(req.auth.user_id);
+    let subscription = r.rows[0] || null;
+    if (subscription?.status === "active" && !membershipActive) {
+      const expired =
+        subscription.current_period_end &&
+        new Date(subscription.current_period_end).getTime() <= Date.now();
+      subscription = {
+        ...subscription,
+        status: expired ? "expired" : "payment_required",
+      };
+    }
     res.json({
       plan: "Gudiya Taxi Partner सदस्यता",
       plans: [
@@ -1171,8 +1198,8 @@ app.get("/api/membership", requireAuth, async (req, res, next) => {
         { months: 6, amountRupees: 301 },
       ],
       autopayOnly: true,
-      active: await hasActiveMembership(req.auth.user_id),
-      subscription: r.rows[0] || null,
+      active: membershipActive,
+      subscription,
     });
   } catch (e) {
     next(e);
