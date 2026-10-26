@@ -13,6 +13,8 @@ const bcrypt = require("bcryptjs");
 const firebaseAdmin = require("firebase-admin");
 
 const app = express();
+// Render terminates public traffic at its reverse proxy; trust the nearest proxy hop.
+app.set("trust proxy", 1);
 const dutyEventClients = new Set();
 function broadcastDutyUpdate() {
   const payload = 'event: duty-update\ndata: {"type":"duties-changed"}\n\n';
@@ -160,14 +162,13 @@ app.post(
         const payment = event.payload?.payment?.entity;
         const subscriptionId = sub?.id || payment?.subscription_id;
         if (subscriptionId) {
-          
-if (
-  ["subscription.activated", "subscription.authenticated"].includes(
-    event.event
-  )
-) {
-  await client.query(
-    `UPDATE subscriptions
+          if (
+            ["subscription.activated", "subscription.authenticated"].includes(
+              event.event
+            )
+          ) {
+            await client.query(
+              `UPDATE subscriptions
      SET status = CASE
        WHEN status = 'active'
             AND current_period_end > now()
@@ -177,15 +178,15 @@ if (
      END,
      updated_at = now()
      WHERE provider_subscription_id = $1`,
-    [subscriptionId]
-  );
-} else if (
-  event.event === "subscription.charged" &&
-  payment?.id &&
-  payment?.status === "captured"
-) {
-  await client.query(
-    `UPDATE subscriptions
+              [subscriptionId]
+            );
+          } else if (
+            event.event === "subscription.charged" &&
+            payment?.id &&
+            payment?.status === "captured"
+          ) {
+            await client.query(
+              `UPDATE subscriptions
      SET status = 'active',
          provider_payment_id = COALESCE($1, provider_payment_id),
          current_period_end = CASE
@@ -196,21 +197,23 @@ if (
          END,
          updated_at = now()
      WHERE provider_subscription_id = $3`,
-    [payment?.id || null, sub?.current_end || null, subscriptionId]
-  );
-} else if (
-  ["subscription.halted", "subscription.cancelled", "subscription.completed"].includes(
-    event.event
-  )
-) {
-  const state =
-    event.event === "subscription.cancelled" ||
-    event.event === "subscription.completed"
-      ? "cancelled"
-      : "halted";
+              [payment?.id || null, sub?.current_end || null, subscriptionId]
+            );
+          } else if (
+            [
+              "subscription.halted",
+              "subscription.cancelled",
+              "subscription.completed",
+            ].includes(event.event)
+          ) {
+            const state =
+              event.event === "subscription.cancelled" ||
+              event.event === "subscription.completed"
+                ? "cancelled"
+                : "halted";
 
-  await client.query(
-    `UPDATE subscriptions
+            await client.query(
+              `UPDATE subscriptions
      SET status = CASE
        WHEN current_period_end > now()
             AND provider_payment_id IS NOT NULL
@@ -219,11 +222,11 @@ if (
      END,
      updated_at = now()
      WHERE provider_subscription_id = $2`,
-    [state, subscriptionId]
-  );
-} else if (event.event === "payment.failed") {
-  await client.query(
-    `UPDATE subscriptions
+              [state, subscriptionId]
+            );
+          } else if (event.event === "payment.failed") {
+            await client.query(
+              `UPDATE subscriptions
      SET status = CASE
        WHEN current_period_end > now()
             AND provider_payment_id IS NOT NULL
@@ -232,9 +235,10 @@ if (
      END,
      updated_at = now()
      WHERE provider_subscription_id = $1`,
-    [subscriptionId]
-  );
-}
+              [subscriptionId]
+            );
+          }
+        }
         await client.query("COMMIT");
         return res.status(200).json({ received: true });
       } catch (e) {
@@ -411,11 +415,9 @@ app.post(
         );
         if (existing.rowCount) {
           await client.query("ROLLBACK");
-          return res
-            .status(409)
-            .json({
-              error: "इस मोबाइल नंबर का अकाउंट पहले से है। लॉगिन करें।",
-            });
+          return res.status(409).json({
+            error: "इस मोबाइल नंबर का अकाउंट पहले से है। लॉगिन करें।",
+          });
         }
         const created = await client.query(
           `INSERT INTO users(phone,name,role_mode,password_hash) VALUES($1,$2,$3,$4)
@@ -633,12 +635,10 @@ app.post("/api/driver-verification", requireAuth, async (req, res, next) => {
         .status(403)
         .json({ error: "इस अकाउंट में वेंडर भूमिका नहीं है" });
     if (category === "both" && role !== "both")
-      return res
-        .status(403)
-        .json({
-          error:
-            "सभी दस्तावेज़ों के लिए ड्राइवर और वेंडर दोनों भूमिका वाला अकाउंट जरूरी है",
-        });
+      return res.status(403).json({
+        error:
+          "सभी दस्तावेज़ों के लिए ड्राइवर और वेंडर दोनों भूमिका वाला अकाउंट जरूरी है",
+      });
     if (!["driver", "vendor", "both"].includes(category))
       return res.status(400).json({ error: "सत्यापन का प्रकार सही नहीं है" });
     const docs = Array.isArray(req.body.documents) ? req.body.documents : [];
@@ -695,12 +695,10 @@ app.post("/api/driver-verification", requireAuth, async (req, res, next) => {
         !seen.has("driving_licence") ||
         !seen.has("vehicle_rc"))
     )
-      return res
-        .status(400)
-        .json({
-          error:
-            "ड्राइवर के लिए Aadhaar, ड्राइविंग लाइसेंस और वाहन RC तीनों जमा करना जरूरी है",
-        });
+      return res.status(400).json({
+        error:
+          "ड्राइवर के लिए Aadhaar, ड्राइविंग लाइसेंस और वाहन RC तीनों जमा करना जरूरी है",
+      });
     if (category === "vendor" && !seen.has("vendor_aadhaar"))
       return res
         .status(400)
@@ -712,12 +710,10 @@ app.post("/api/driver-verification", requireAuth, async (req, res, next) => {
         !seen.has("vehicle_rc") ||
         !seen.has("vendor_aadhaar"))
     )
-      return res
-        .status(400)
-        .json({
-          error:
-            "ड्राइवर + वेंडर के लिए दोनों Aadhaar, ड्राइविंग लाइसेंस और वाहन RC जमा करना जरूरी है",
-        });
+      return res.status(400).json({
+        error:
+          "ड्राइवर + वेंडर के लिए दोनों Aadhaar, ड्राइविंग लाइसेंस और वाहन RC जमा करना जरूरी है",
+      });
     const client = await pool.connect();
     try {
       await client.query("BEGIN");
@@ -755,14 +751,12 @@ app.post("/api/driver-verification", requireAuth, async (req, res, next) => {
         ]
       );
       await client.query("COMMIT");
-      return res
-        .status(201)
-        .json({
-          ok: true,
-          category,
-          verification: "pending",
-          message: "दस्तावेज़ सुरक्षित रूप से जमा हुए; प्रशासनिक जाँच बाकी है।",
-        });
+      return res.status(201).json({
+        ok: true,
+        category,
+        verification: "pending",
+        message: "दस्तावेज़ सुरक्षित रूप से जमा हुए; प्रशासनिक जाँच बाकी है।",
+      });
     } catch (e) {
       await client.query("ROLLBACK").catch(() => {});
       throw e;
@@ -958,11 +952,9 @@ app.post("/api/duties/:id/accept", requireAuth, async (req, res, next) => {
       }
       if (duty.status !== "open") {
         await client.query("ROLLBACK");
-        return res
-          .status(409)
-          .json({
-            error: "यह ड्यूटी पहले ही स्वीकार हो चुकी है या उपलब्ध नहीं है",
-          });
+        return res.status(409).json({
+          error: "यह ड्यूटी पहले ही स्वीकार हो चुकी है या उपलब्ध नहीं है",
+        });
       }
       const updated = await client.query(
         `UPDATE duties SET status='accepted', accepted_by_user_id=$2
@@ -1106,12 +1098,10 @@ app.post("/api/membership/autopay", requireAuth, async (req, res, next) => {
         .status(400)
         .json({ error: "सदस्यता अवधि 1, 3 या 6 महीने चुनें" });
     if (!razorpay || !selected.planId)
-      return res
-        .status(503)
-        .json({
-          error:
-            "चुना हुआ सदस्यता प्लान अभी भुगतान सर्वर पर कॉन्फ़िगर नहीं है। अभी कोई पैसा नहीं कटा।",
-        });
+      return res.status(503).json({
+        error:
+          "चुना हुआ सदस्यता प्लान अभी भुगतान सर्वर पर कॉन्फ़िगर नहीं है। अभी कोई पैसा नहीं कटा।",
+      });
     const existing = await pool.query(
       `SELECT provider_subscription_id,status FROM subscriptions WHERE user_id=$1
       AND plan_months=$2 AND status IN ('created','authenticated','active','pending') ORDER BY created_at DESC LIMIT 1`,
@@ -1138,17 +1128,15 @@ app.post("/api/membership/autopay", requireAuth, async (req, res, next) => {
       VALUES($1,$2,$3,$4,'created') ON CONFLICT(provider_subscription_id) DO NOTHING`,
       [req.auth.user_id, created.id, months, selected.amount]
     );
-    res
-      .status(201)
-      .json({
-        subscriptionId: created.id,
-        status: created.status,
-        shortUrl: created.short_url || null,
-        planMonths: months,
-        amountRupees: selected.amount,
-        message:
-          "Complete authorization using Razorpay checkout. Membership activates only after a verified payment webhook.",
-      });
+    res.status(201).json({
+      subscriptionId: created.id,
+      status: created.status,
+      shortUrl: created.short_url || null,
+      planMonths: months,
+      amountRupees: selected.amount,
+      message:
+        "Complete authorization using Razorpay checkout. Membership activates only after a verified payment webhook.",
+    });
   } catch (e) {
     next(e);
   }
