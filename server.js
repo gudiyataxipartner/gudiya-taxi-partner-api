@@ -392,15 +392,15 @@ app.post(
       const role = String(req.body.roleMode || "both");
       const deviceId = String(req.body.deviceId || "").trim();
       if (name.length < 2)
-        return res.status(400).json({ error: "अपना नाम भरें" });
+        return res.status(400).json({ error: "啶呧お啶ㄠぞ 啶ㄠぞ啶� 啶ぐ啷囙" });
       if (password.length < 8 || password.length > 72)
         return res
           .status(400)
-          .json({ error: "पासवर्ड कम से कम 8 अक्षरों का होना चाहिए" });
+          .json({ error: "啶ぞ啶膏さ啶班啶� 啶曕ぎ 啶膏 啶曕ぎ 8 啶呧啷嵿し啶班啶� 啶曕ぞ 啶灌啶ㄠぞ 啶氞ぞ啶灌た啶�" });
       if (!["driver", "vendor", "both"].includes(role))
-        return res.status(400).json({ error: "भूमिका सही चुनें" });
+        return res.status(400).json({ error: "啶啶た啶曕ぞ 啶膏す啷€ 啶氞啶ㄠ啶�" });
       if (deviceId.length < 8 || deviceId.length > 200)
-        return res.status(400).json({ error: "डिवाइस ID सही नहीं है" });
+        return res.status(400).json({ error: "啶∴た啶掂ぞ啶囙じ ID 啶膏す啷€ 啶ㄠす啷€啶� 啶灌" });
       requireConfig();
       const passwordHash = await bcrypt.hash(password, 12);
       const client = await pool.connect();
@@ -415,7 +415,7 @@ app.post(
           return res
             .status(409)
             .json({
-              error: "इस मोबाइल नंबर का अकाउंट पहले से है। लॉगिन करें।",
+              error: "啶囙じ 啶啶ぞ啶囙げ 啶ㄠ啶ぐ 啶曕ぞ 啶呧啶距啶傕 啶す啶侧 啶膏 啶灌啷� 啶侧啶椸た啶� 啶曕ぐ啷囙啷�",
             });
         }
         const created = await client.query(
@@ -465,7 +465,7 @@ app.post(
       )
         return res
           .status(400)
-          .json({ error: "मोबाइल, पासवर्ड और डिवाइस जानकारी सही भरें" });
+          .json({ error: "啶啶ぞ啶囙げ, 啶ぞ啶膏さ啶班啶� 啶斷ぐ 啶∴た啶掂ぞ啶囙じ 啶溹ぞ啶ㄠ啶距ぐ啷€ 啶膏す啷€ 啶ぐ啷囙" });
       requireConfig();
       const found = await pool.query(
         "SELECT id,phone,name,role_mode,driver_verification,vendor_verification,password_hash FROM users WHERE phone=$1",
@@ -476,7 +476,7 @@ app.post(
         !found.rows[0].password_hash ||
         !(await bcrypt.compare(password, found.rows[0].password_hash))
       )
-        return res.status(401).json({ error: "मोबाइल नंबर या पासवर्ड गलत है" });
+        return res.status(401).json({ error: "啶啶ぞ啶囙げ 啶ㄠ啶ぐ 啶ぞ 啶ぞ啶膏さ啶班啶� 啶椸げ啶� 啶灌" });
       const user = found.rows[0];
       delete user.password_hash;
       const client = await pool.connect();
@@ -524,7 +524,7 @@ app.post(
       await twilioClient.verify.v2
         .services(process.env.TWILIO_VERIFY_SERVICE_SID)
         .verifications.create({ to: "+91" + phone, channel: "sms" });
-      res.json({ sent: true, message: "OTP भेज दिया गया है" });
+      res.json({ sent: true, message: "OTP 啶啶� 啶︵た啶ぞ 啶椸く啶� 啶灌" });
     } catch (e) {
       next(e);
     }
@@ -543,7 +543,7 @@ app.post(
         deviceId.length < 8 ||
         deviceId.length > 200
       )
-        return res.status(400).json({ error: "OTP और device ID सही भरें" });
+        return res.status(400).json({ error: "OTP 啶斷ぐ device ID 啶膏す啷€ 啶ぐ啷囙" });
       if (!twilioClient || !process.env.TWILIO_VERIFY_SERVICE_SID)
         return res
           .status(503)
@@ -552,7 +552,7 @@ app.post(
         .services(process.env.TWILIO_VERIFY_SERVICE_SID)
         .verificationChecks.create({ to: "+91" + phone, code });
       if (check.status !== "approved")
-        return res.status(401).json({ error: "OTP गलत या समाप्त हो गया है" });
+        return res.status(401).json({ error: "OTP 啶椸げ啶� 啶ぞ 啶膏ぎ啶距お啷嵿い 啶灌 啶椸く啶� 啶灌" });
       requireConfig();
       const client = await pool.connect();
       try {
@@ -684,25 +684,25 @@ app.post("/api/driver-verification", requireAuth, async (req, res, next) => {
     if (category === "driver" && !["driver", "both"].includes(role))
       return res
         .status(403)
-        .json({ error: "इस अकाउंट में ड्राइवर भूमिका नहीं है" });
+        .json({ error: "啶囙じ 啶呧啶距啶傕 啶啶� 啶∴啶班ぞ啶囙さ啶� 啶啶た啶曕ぞ 啶ㄠす啷€啶� 啶灌" });
     if (category === "vendor" && !["vendor", "both"].includes(role))
       return res
         .status(403)
-        .json({ error: "इस अकाउंट में वेंडर भूमिका नहीं है" });
+        .json({ error: "啶囙じ 啶呧啶距啶傕 啶啶� 啶掂啶傕ぁ啶� 啶啶た啶曕ぞ 啶ㄠす啷€啶� 啶灌" });
     if (category === "both" && role !== "both")
       return res
         .status(403)
         .json({
           error:
-            "सभी दस्तावेज़ों के लिए ड्राइवर और वेंडर दोनों भूमिका वाला अकाउंट जरूरी है",
+            "啶膏き啷€ 啶︵じ啷嵿い啶距さ啷囙啶监啶� 啶曕 啶侧た啶� 啶∴啶班ぞ啶囙さ啶� 啶斷ぐ 啶掂啶傕ぁ啶� 啶︵啶ㄠ啶� 啶啶た啶曕ぞ 啶掂ぞ啶侧ぞ 啶呧啶距啶傕 啶溹ぐ啷傕ぐ啷€ 啶灌",
         });
     if (!["driver", "vendor", "both"].includes(category))
-      return res.status(400).json({ error: "सत्यापन का प्रकार सही नहीं है" });
+      return res.status(400).json({ error: "啶膏い啷嵿く啶距お啶� 啶曕ぞ 啶啶班啶距ぐ 啶膏す啷€ 啶ㄠす啷€啶� 啶灌" });
     const docs = Array.isArray(req.body.documents) ? req.body.documents : [];
     if (!docs.length || docs.length > 4)
       return res
         .status(400)
-        .json({ error: "सत्यापन के लिए जरूरी दस्तावेज़ जोड़ें" });
+        .json({ error: "啶膏い啷嵿く啶距お啶� 啶曕 啶侧た啶� 啶溹ぐ啷傕ぐ啷€ 啶︵じ啷嵿い啶距さ啷囙啶� 啶溹啶∴ぜ啷囙" });
     const allowed =
       category === "driver"
         ? new Set(["driving_licence", "vehicle_rc", "aadhaar"])
@@ -724,11 +724,11 @@ app.post("/api/driver-verification", requireAuth, async (req, res, next) => {
       if (!allowed.has(type) || seen.has(type))
         return res
           .status(400)
-          .json({ error: "दस्तावेज़ का प्रकार सही नहीं है या दोहराया गया है" });
+          .json({ error: "啶︵じ啷嵿い啶距さ啷囙啶� 啶曕ぞ 啶啶班啶距ぐ 啶膏す啷€ 啶ㄠす啷€啶� 啶灌 啶ぞ 啶︵啶灌ぐ啶距く啶� 啶椸く啶� 啶灌" });
       if (!["application/pdf", "image/jpeg", "image/png"].includes(mime))
         return res
           .status(400)
-          .json({ error: "केवल PDF, JPG या PNG फाइल स्वीकार हैं" });
+          .json({ error: "啶曕啶掂げ PDF, JPG 啶ぞ PNG 啶ぞ啶囙げ 啶膏啶掂啶曕ぞ啶� 啶灌啶�" });
       const raw = Buffer.from(base64, "base64");
       if (
         !raw.length ||
@@ -737,7 +737,7 @@ app.post("/api/driver-verification", requireAuth, async (req, res, next) => {
       )
         return res
           .status(400)
-          .json({ error: "हर दस्तावेज़ 4 MB से छोटा और सही फाइल होना चाहिए" });
+          .json({ error: "啶灌ぐ 啶︵じ啷嵿い啶距さ啷囙啶� 4 MB 啶膏 啶涏啶熰ぞ 啶斷ぐ 啶膏す啷€ 啶ぞ啶囙げ 啶灌啶ㄠぞ 啶氞ぞ啶灌た啶�" });
       seen.add(type);
       normalized.push({
         type,
@@ -756,12 +756,12 @@ app.post("/api/driver-verification", requireAuth, async (req, res, next) => {
         .status(400)
         .json({
           error:
-            "ड्राइवर के लिए Aadhaar, ड्राइविंग लाइसेंस और वाहन RC तीनों जमा करना जरूरी है",
+            "啶∴啶班ぞ啶囙さ啶� 啶曕 啶侧た啶� Aadhaar, 啶∴啶班ぞ啶囙さ啶苦啶� 啶侧ぞ啶囙じ啷囙啶� 啶斷ぐ 啶掂ぞ啶灌え RC 啶む啶ㄠ啶� 啶溹ぎ啶� 啶曕ぐ啶ㄠぞ 啶溹ぐ啷傕ぐ啷€ 啶灌",
         });
     if (category === "vendor" && !seen.has("vendor_aadhaar"))
       return res
         .status(400)
-        .json({ error: "वेंडर सत्यापन के लिए Aadhaar कार्ड जमा करें" });
+        .json({ error: "啶掂啶傕ぁ啶� 啶膏い啷嵿く啶距お啶� 啶曕 啶侧た啶� Aadhaar 啶曕ぞ啶班啶� 啶溹ぎ啶� 啶曕ぐ啷囙" });
     if (
       category === "both" &&
       (!seen.has("aadhaar") ||
@@ -773,7 +773,7 @@ app.post("/api/driver-verification", requireAuth, async (req, res, next) => {
         .status(400)
         .json({
           error:
-            "ड्राइवर + वेंडर के लिए दोनों Aadhaar, ड्राइविंग लाइसेंस और वाहन RC जमा करना जरूरी है",
+            "啶∴啶班ぞ啶囙さ啶� + 啶掂啶傕ぁ啶� 啶曕 啶侧た啶� 啶︵啶ㄠ啶� Aadhaar, 啶∴啶班ぞ啶囙さ啶苦啶� 啶侧ぞ啶囙じ啷囙啶� 啶斷ぐ 啶掂ぞ啶灌え RC 啶溹ぎ啶� 啶曕ぐ啶ㄠぞ 啶溹ぐ啷傕ぐ啷€ 啶灌",
         });
     const client = await pool.connect();
     try {
@@ -818,7 +818,7 @@ app.post("/api/driver-verification", requireAuth, async (req, res, next) => {
           ok: true,
           category,
           verification: "pending",
-          message: "दस्तावेज़ सुरक्षित रूप से जमा हुए; प्रशासनिक जाँच बाकी है।",
+          message: "啶︵じ啷嵿い啶距さ啷囙啶� 啶膏啶班啷嵿し啶苦い 啶班啶� 啶膏 啶溹ぎ啶� 啶灌啶�; 啶啶班ざ啶距じ啶ㄠた啶� 啶溹ぞ啶佮 啶ぞ啶曕 啶灌啷�",
         });
     } catch (e) {
       await client.query("ROLLBACK").catch(() => {});
@@ -868,11 +868,11 @@ app.post("/api/duties", requireAuth, async (req, res, next) => {
     if (!pickup || !drop || !vehicle)
       return res
         .status(400)
-        .json({ error: "Pickup, drop और vehicle जरूरी हैं" });
+        .json({ error: "Pickup, drop 啶斷ぐ vehicle 啶溹ぐ啷傕ぐ啷€ 啶灌啶�" });
     if (!["driver", "vendor"].includes(role))
       return res.status(400).json({ error: "Invalid role" });
     if (req.auth.role_mode !== "both" && req.auth.role_mode !== role)
-      return res.status(403).json({ error: "इस भूमिका की अनुमति नहीं है" });
+      return res.status(403).json({ error: "啶囙じ 啶啶た啶曕ぞ 啶曕 啶呧え啷佮ぎ啶むた 啶ㄠす啷€啶� 啶灌" });
     const payout =
       req.body.payoutRupees == null || req.body.payoutRupees === ""
         ? null
@@ -885,7 +885,7 @@ app.post("/api/duties", requireAuth, async (req, res, next) => {
     const r = await pool.query(
       `INSERT INTO duties(user_id,role_posted_as,pickup_city,pickup_address_private,drop_city,drop_address_private,
       vehicle_type,duty_date,duty_time,payout_paise,notes_private,distance_km,distance_label)
-      VALUES($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11,NULL,'लगभग दूरी')
+      VALUES($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11,NULL,'啶侧啶 啶︵啶班')
       RETURNING id,pickup_city,drop_city,vehicle_type,duty_date,duty_time,distance_km,distance_label,created_at,status`,
       [
         req.auth.user_id,
@@ -966,11 +966,11 @@ app.post("/api/duties/:id/accept", requireAuth, async (req, res, next) => {
   try {
     const id = String(req.params.id || "");
     if (!/^\\d+$/.test(id))
-      return res.status(400).json({ error: "ड्यूटी ID सही नहीं है" });
+      return res.status(400).json({ error: "啶∴啶啶熰 ID 啶膏す啷€ 啶ㄠす啷€啶� 啶灌" });
     if (!["driver", "both"].includes(req.auth.role_mode))
       return res
         .status(403)
-        .json({ error: "ड्यूटी स्वीकार करने के लिए ड्राइवर अकाउंट जरूरी है" });
+        .json({ error: "啶∴啶啶熰 啶膏啶掂啶曕ぞ啶� 啶曕ぐ啶ㄠ 啶曕 啶侧た啶� 啶∴啶班ぞ啶囙さ啶� 啶呧啶距啶傕 啶溹ぐ啷傕ぐ啷€ 啶灌" });
     const client = await pool.connect();
     try {
       await client.query("BEGIN");
@@ -980,21 +980,21 @@ app.post("/api/duties/:id/accept", requireAuth, async (req, res, next) => {
       );
       if (!found.rowCount) {
         await client.query("ROLLBACK");
-        return res.status(404).json({ error: "ड्यूटी नहीं मिली" });
+        return res.status(404).json({ error: "啶∴啶啶熰 啶ㄠす啷€啶� 啶た啶侧" });
       }
       const duty = found.rows[0];
       if (String(duty.user_id) === String(req.auth.user_id)) {
         await client.query("ROLLBACK");
         return res
           .status(403)
-          .json({ error: "अपनी ड्यूटी खुद स्वीकार नहीं कर सकते" });
+          .json({ error: "啶呧お啶ㄠ 啶∴啶啶熰 啶栢啶� 啶膏啶掂啶曕ぞ啶� 啶ㄠす啷€啶� 啶曕ぐ 啶膏啶む" });
       }
       if (duty.status !== "open") {
         await client.query("ROLLBACK");
         return res
           .status(409)
           .json({
-            error: "यह ड्यूटी पहले ही स्वीकार हो चुकी है या उपलब्ध नहीं है",
+            error: "啶す 啶∴啶啶熰 啶す啶侧 啶灌 啶膏啶掂啶曕ぞ啶� 啶灌 啶氞啶曕 啶灌 啶ぞ 啶夃お啶侧が啷嵿ぇ 啶ㄠす啷€啶� 啶灌",
           });
       }
       const updated = await client.query(
@@ -1006,13 +1006,13 @@ app.post("/api/duties/:id/accept", requireAuth, async (req, res, next) => {
         await client.query("ROLLBACK");
         return res
           .status(409)
-          .json({ error: "यह ड्यूटी किसी दूसरे ड्राइवर ने स्वीकार कर ली है" });
+          .json({ error: "啶す 啶∴啶啶熰 啶曕た啶膏 啶︵啶膏ぐ啷� 啶∴啶班ぞ啶囙さ啶� 啶ㄠ 啶膏啶掂啶曕ぞ啶� 啶曕ぐ 啶侧 啶灌" });
       }
       await client.query("COMMIT");
       broadcastDutyUpdate();
       return res.json({
         duty: updated.rows[0],
-        message: "ड्यूटी सफलतापूर्वक स्वीकार हो गई",
+        message: "啶∴啶啶熰 啶膏か啶侧い啶距お啷傕ぐ啷嵿さ啶� 啶膏啶掂啶曕ぞ啶� 啶灌 啶椸",
       });
     } catch (e) {
       await client.query("ROLLBACK").catch(() => {});
@@ -1086,13 +1086,13 @@ app.post("/api/membership/autopay", requireAuth, async (req, res, next) => {
     if (!selected)
       return res
         .status(400)
-        .json({ error: "सदस्यता अवधि 1, 3 या 6 महीने चुनें" });
+        .json({ error: "啶膏う啶膏啶い啶� 啶呧さ啶оた 1, 3 啶ぞ 6 啶す啷€啶ㄠ 啶氞啶ㄠ啶�" });
     if (!razorpay || !selected.planId)
       return res
         .status(503)
         .json({
           error:
-            "चुना हुआ सदस्यता प्लान अभी भुगतान सर्वर पर कॉन्फ़िगर नहीं है। अभी कोई पैसा नहीं कटा।",
+            "啶氞啶ㄠぞ 啶灌啶� 啶膏う啶膏啶い啶� 啶啶侧ぞ啶� 啶呧き啷€ 啶啶椸い啶距え 啶膏ぐ啷嵿さ啶� 啶ぐ 啶曕啶ㄠ啶ぜ啶苦啶� 啶ㄠす啷€啶� 啶灌啷� 啶呧き啷€ 啶曕啶� 啶啶膏ぞ 啶ㄠす啷€啶� 啶曕啶距イ",
         });
     const existing = await pool.query(
       `SELECT provider_subscription_id,status FROM subscriptions WHERE user_id=$1
@@ -1148,7 +1148,7 @@ app.get("/api/membership", requireAuth, async (req, res, next) => {
       [req.auth.user_id]
     );
     res.json({
-      plan: "Gudiya Taxi Partner सदस्यता",
+      plan: "Gudiya Taxi Partner 啶膏う啶膏啶い啶�",
       plans: [
         { months: 1, amountRupees: 51 },
         { months: 3, amountRupees: 151 },
@@ -1199,10 +1199,23 @@ app.get(
         'attachment; filename="' +
           String(doc.filename || "document").replace(/[\r\n"\\]/g, "_") + '"' ); res.set("Cache-Control", "no-store"); res.send(bytes); } catch (e) { next(e); } } ); app.post( "/api/admin/documents/:id/review", requireAdmin, async (req, res, next) => { try { const status = String(req.body.status || ""); if (!["approved", "rejected"].includes(status)) return res .status(400) .json({ error: "status must be approved or rejected" }); const client = await pool.connect(); try { await client.query("BEGIN"); const doc = await client.query( `UPDATE driver_documents SET status=$1,reviewer_note=$2,reviewed_at=now() WHERE id=$3 AND status='pending' RETURNING user_id`, [status, String(req.body.note || "").slice(0, 500), req.params.id] ); if (!doc.rowCount) { await client.query("ROLLBACK"); return res.status(404).json({ error: "Pending document not found" }); } const docType = await client.query( "SELECT document_type FROM driver_documents WHERE id=$1", [req.params.id] ); const category = docType.rows[0]?.document_type?.startsWith("vendor_") ? "vendor" : "driver"; const types = category === "vendor" ? ["vendor_aadhaar"] : ["aadhaar", "driving_licence", "vehicle_rc"]; const pending = await client.query( `SELECT count(*)::int AS n FROM driver_documents WHERE user_id=$1 AND document_type = ANY($2::text[]) AND status='pending'`, [doc.rows[0].user_id, types] ); const rejected = await client.query( `SELECT count(*)::int AS n FROM driver_documents WHERE user_id=$1 AND document_type = ANY($2::text[]) AND status='rejected'`, [doc.rows[0].user_id, types] ); const approved = await client.query( `SELECT count(*)::int AS n FROM driver_documents WHERE user_id=$1 AND document_type = ANY($2::text[]) AND status='approved'`, [doc.rows[0].user_id, types] ); let verify = "pending"; if (Number(rejected.rows[0].n) > 0) verify = "rejected"; else if ( Number(pending.rows[0].n) === 0 && Number(approved.rows[0].n) >= (category === "vendor" ? 1 : 3) ) verify = "approved"; const column = category === "vendor" ? "vendor_verification" : "driver_verification"; await client.query( `UPDATE users SET ${column}=$1,updated_at=now() WHERE id=$2`, [verify, doc.rows[0].user_id] ); await client.query( "INSERT INTO audit_log(action,subject_type,subject_id,details) VALUES($1,$2,$3,$4)", [ category + "_document_review", "driver_document", String(req.params.id), JSON.stringify({ status, verify }), ] ); await client.query("COMMIT"); res.json({ ok: true, category, verification: verify }); } catch (e) { await client.query("ROLLBACK"); throw e; } finally { client.release(); } } catch (e) { next(e); } } ); app.use((err, _req, res, _next) => { console.error(err.message); const status = Number(err.status) || 500; res .status(status) .json({ error: status < 500 ? err.message : "Server error" }); }); // Bootstrap the complete schema before accepting requests. This also fixes login's
 // generic Server error on a fresh Gudiya database where users/device_sessions did not exist.
-const schemaSql = fs.readFileSync(
+// Locate schema.sql whether this file is started from the repository root
+// (node server.js) or from the src directory (node src/server.js).
+const schemaCandidates = [
+  path.join(__dirname, "schema.sql"),
   path.join(__dirname, "..", "schema.sql"),
-  "utf8"
+  path.join(process.cwd(), "schema.sql"),
+];
+const schemaPath = schemaCandidates.find((candidate) =>
+  fs.existsSync(candidate)
 );
+if (!schemaPath) {
+  throw new Error(
+    "schema.sql not found. Checked: " + schemaCandidates.join(", ")
+  );
+}
+console.log("Loading database schema from:", schemaPath);
+const schemaSql = fs.readFileSync(schemaPath, "utf8");
 pool
   .query(schemaSql)
   .then(() =>
