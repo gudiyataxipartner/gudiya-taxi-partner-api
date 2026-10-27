@@ -133,6 +133,8 @@ ALTER TABLE subscriptions
   ADD COLUMN IF NOT EXISTS plan_months INTEGER;
 
 ALTER TABLE subscriptions
+  ADD COLUMN IF NOT EXISTS provider TEXT NOT NULL DEFAULT 'razorpay';
+ALTER TABLE subscriptions
   ADD COLUMN IF NOT EXISTS amount_rupees INTEGER;
 
 ALTER TABLE driver_documents
