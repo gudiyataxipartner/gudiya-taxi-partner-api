@@ -1283,6 +1283,234 @@ app.post(
   }
 );
 
+
+/* GUDIYA TAXI PARTNER ADMIN API ROUTES */
+
+app.get("/api/admin/dashboard", requireAdmin, async (_req, res, next) => {
+  try {
+    const [users, active, documents, duties, payments, paid] =
+      await Promise.all([
+        pool.query(`SELECT COUNT(*)::int AS total FROM users`),
+        pool.query(`
+          SELECT COUNT(DISTINCT user_id)::int AS total
+          FROM device_sessions
+          WHERE revoked_at IS NULL
+            AND last_seen_at > now() - interval '30 days'
+        `),
+        pool.query(`
+          SELECT COUNT(*)::int AS total
+          FROM driver_documents WHERE status='pending'
+        `),
+        pool.query(`
+          SELECT COUNT(*)::int AS total,
+            COUNT(*) FILTER (WHERE status='open')::int AS open,
+            COUNT(*) FILTER (WHERE status='accepted')::int AS accepted,
+            COUNT(*) FILTER (WHERE status='booked')::int AS booked,
+            COUNT(*) FILTER (WHERE status='completed')::int AS completed,
+            COUNT(*) FILTER (WHERE status='cancelled')::int AS cancelled
+          FROM duties
+        `),
+        pool.query(`
+          SELECT COUNT(*)::int AS total
+          FROM membership_payment_requests WHERE status='pending'
+        `),
+        pool.query(`
+          SELECT COUNT(*)::int AS total
+          FROM users u
+          LEFT JOIN admin_membership_overrides o ON o.user_id=u.id
+          WHERE COALESCE(
+            o.status,
+            CASE WHEN EXISTS (
+              SELECT 1 FROM subscriptions s
+              WHERE s.user_id=u.id
+                AND s.provider='manual_upi'
+                AND s.status='active'
+                AND s.provider_payment_id IS NOT NULL
+                AND s.current_period_end > now()
+            ) THEN 'paid' ELSE 'unpaid' END
+          )='paid'
+        `)
+      ]);
+
+    const totalUsers = Number(users.rows[0].total || 0);
+
+    res.json({
+      users: {
+        total: totalUsers,
+        paid: Number(paid.rows[0].total || 0),
+        unpaid: Math.max(
+          0,
+          totalUsers - Number(paid.rows[0].total || 0)
+        ),
+        active: Number(active.rows[0].total || 0)
+      },
+      documents: {
+        pending: Number(documents.rows[0].total || 0)
+      },
+      duties: duties.rows[0],
+      payments: {
+        pending: Number(payments.rows[0].total || 0)
+      }
+    });
+  } catch (e) {
+    next(e);
+  }
+});
+
+app.get("/api/admin/users", requireAdmin, async (req, res, next) => {
+  try {
+    const q = String(req.query.q || "").trim().slice(0, 100);
+
+    const result = await pool.query(`
+      SELECT u.id, u.name, u.phone, u.role_mode,
+        u.driver_verification, u.vendor_verification, u.created_at,
+        CASE
+          WHEN o.status IS NOT NULL THEN o.status
+          WHEN EXISTS (
+            SELECT 1 FROM subscriptions s
+            WHERE s.user_id=u.id
+              AND s.provider='manual_upi'
+              AND s.status='active'
+              AND s.provider_payment_id IS NOT NULL
+              AND s.current_period_end > now()
+          ) THEN 'paid'
+          ELSE 'unpaid'
+        END AS membership_status,
+        CASE WHEN EXISTS (
+          SELECT 1 FROM device_sessions ds
+          WHERE ds.user_id=u.id
+            AND ds.revoked_at IS NULL
+            AND ds.last_seen_at > now() - interval '30 days'
+        ) THEN 'active' ELSE 'inactive' END AS login_status
+      FROM users u
+      LEFT JOIN admin_membership_overrides o ON o.user_id=u.id
+      WHERE ($1='' OR u.name ILIKE '%' || $1 || '%'
+        OR u.phone ILIKE '%' || $1 || '%'
+        OR u.id::text=$1)
+      ORDER BY u.created_at DESC
+      LIMIT 500
+    `, [q]);
+
+    res.json({ users: result.rows });
+  } catch (e) {
+    next(e);
+  }
+});
+
+app.get("/api/admin/users/:id", requireAdmin, async (req, res, next) => {
+  try {
+    if (!/^\d+$/.test(String(req.params.id))) {
+      return res.status(400).json({ error: "Invalid user ID" });
+    }
+
+    const found = await pool.query(`
+      SELECT u.id, u.name, u.phone, u.role_mode,
+        u.driver_verification, u.vendor_verification, u.created_at,
+        COALESCE(o.status, CASE WHEN EXISTS (
+          SELECT 1 FROM subscriptions s
+          WHERE s.user_id=u.id
+            AND s.provider='manual_upi'
+            AND s.status='active'
+            AND s.provider_payment_id IS NOT NULL
+            AND s.current_period_end > now()
+        ) THEN 'paid' ELSE 'unpaid' END) AS membership_status
+      FROM users u
+      LEFT JOIN admin_membership_overrides o ON o.user_id=u.id
+      WHERE u.id=$1
+    `, [req.params.id]);
+
+    if (!found.rowCount) {
+      return res.status(404).json({ error: "User not found" });
+    }
+
+    const [docs, duties, sessions] = await Promise.all([
+      pool.query(`
+        SELECT id, document_type, status, created_at, reviewed_at
+        FROM driver_documents
+        WHERE user_id=$1 ORDER BY created_at DESC LIMIT 50
+      `, [req.params.id]),
+      pool.query(`
+        SELECT id, pickup_city, drop_city, vehicle_type,
+          duty_date, duty_time, status, created_at
+        FROM duties
+        WHERE user_id=$1 OR accepted_by_user_id=$1
+        ORDER BY created_at DESC LIMIT 50
+      `, [req.params.id]),
+      pool.query(`
+        SELECT created_at, last_seen_at, revoked_at
+        FROM device_sessions
+        WHERE user_id=$1 ORDER BY last_seen_at DESC LIMIT 20
+      `, [req.params.id])
+    ]);
+
+    res.json({
+      user: found.rows[0],
+      documents: docs.rows,
+      duties: duties.rows,
+      sessions: sessions.rows
+    });
+  } catch (e) {
+    next(e);
+  }
+});
+
+app.get("/api/admin/documents", requireAdmin, async (req, res, next) => {
+  try {
+    const status = String(req.query.status || "all");
+    const type = String(req.query.type || "all");
+
+    const result = await pool.query(`
+      SELECT d.id, d.user_id, d.document_type, d.status,
+        d.created_at, d.reviewed_at,
+        u.name AS user_name, u.phone, u.role_mode
+      FROM driver_documents d
+      JOIN users u ON u.id=d.user_id
+      WHERE ($1='all' OR d.status=$1)
+        AND ($2='all' OR d.document_type=$2)
+      ORDER BY d.created_at DESC
+      LIMIT 500
+    `, [status, type]);
+
+    res.json({ documents: result.rows });
+  } catch (e) {
+    next(e);
+  }
+});
+
+app.get("/api/admin/duties", requireAdmin, async (req, res, next) => {
+  try {
+    const q = String(req.query.q || "").trim().slice(0, 100);
+    const status = String(req.query.status || "all");
+    const role = String(req.query.role || "all");
+
+    const result = await pool.query(`
+      SELECT d.id, d.user_id, d.pickup_city, d.drop_city,
+        d.vehicle_type, d.role_posted_as, d.duty_date, d.duty_time,
+        d.distance_km, d.payout_paise, d.status, d.created_at,
+        u.name AS poster_name, u.phone AS poster_phone,
+        a.name AS accepted_by_name, a.phone AS accepted_by_phone
+      FROM duties d
+      JOIN users u ON u.id=d.user_id
+      LEFT JOIN users a ON a.id=d.accepted_by_user_id
+      WHERE ($1='' OR d.pickup_city ILIKE '%' || $1 || '%'
+        OR d.drop_city ILIKE '%' || $1 || '%'
+        OR u.phone ILIKE '%' || $1 || '%'
+        OR u.name ILIKE '%' || $1 || '%'
+        OR d.id::text=$1)
+        AND ($2='all' OR d.status=$2)
+        AND ($3='all' OR d.role_posted_as=$3)
+      ORDER BY d.created_at DESC
+      LIMIT 500
+    `, [q, status, role]);
+
+    res.json({ duties: result.rows });
+  } catch (e) {
+    next(e);
+  }
+});
+
+/* END GUDIYA TAXI PARTNER ADMIN API ROUTES */
+
 // Admin endpoints: protect with a separate high-entropy key configured only on the server.
 app.get(
   "/api/admin/documents/pending",
