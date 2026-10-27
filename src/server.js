@@ -194,7 +194,87 @@ app.get("/api/duties/events", requireAuth, (req, res) => {
   });
 });
 
+// Admin username/password login. Configure ADMIN_USERNAME, ADMIN_PASSWORD and JWT_SECRET
+// as private environment variables on Render; never hard-code credentials in source code.
+const adminLoginLimiter = rateLimit({
+  windowMs: 15 * 60 * 1000,
+  limit: 10,
+  standardHeaders: true,
+  legacyHeaders: false,
+  message: {
+    error: "Too many login attempts. Please try again in 15 minutes.",
+  },
+});
+
+app.post("/api/admin/auth/login", adminLoginLimiter, async (req, res) => {
+  try {
+    const configuredUsername = process.env.ADMIN_USERNAME || "";
+    const configuredPassword = process.env.ADMIN_PASSWORD || "";
+    const jwtSecret = process.env.JWT_SECRET || "";
+    const username = String(req.body?.username || "");
+    const password = String(req.body?.password || "");
+
+    const safeEqual = (a, b) => {
+      const aa = Buffer.from(String(a));
+      const bb = Buffer.from(String(b));
+      return (
+        aa.length === bb.length &&
+        aa.length > 0 &&
+        crypto.timingSafeEqual(aa, bb)
+      );
+    };
+
+    if (
+      configuredUsername.length < 3 ||
+      configuredPassword.length < 12 ||
+      jwtSecret.length < 32
+    ) {
+      return res
+        .status(503)
+        .json({ error: "Admin login is not configured on the server." });
+    }
+    if (
+      !safeEqual(username, configuredUsername) ||
+      !safeEqual(password, configuredPassword)
+    ) {
+      return res.status(401).json({ error: "Username या Password गलत है।" });
+    }
+
+    const token = jwt.sign(
+      { admin: true, purpose: "admin-session", username: configuredUsername },
+      jwtSecret,
+      { expiresIn: "12h", issuer: "gudiya-taxi-partner-admin" }
+    );
+    return res.json({ token, expiresIn: 43200, username: configuredUsername });
+  } catch (error) {
+    console.error("Admin login failed:", error.message);
+    return res
+      .status(500)
+      .json({ error: "Admin login failed. Please try again." });
+  }
+});
+
 function requireAdmin(req, res, next) {
+  const authorization = req.get("authorization") || "";
+  const match = authorization.match(/^Bearer\s+(.+)$/i);
+  if (match) {
+    try {
+      const decoded = jwt.verify(match[1], process.env.JWT_SECRET || "", {
+        issuer: "gudiya-taxi-partner-admin",
+      });
+      if (
+        decoded?.admin === true &&
+        decoded?.purpose === "admin-session" &&
+        decoded?.username
+      ) {
+        req.admin = { username: decoded.username };
+        return next();
+      }
+    } catch (_) {
+      // Continue to legacy API-key validation for backward compatibility.
+    }
+  }
+
   const expected = process.env.ADMIN_API_KEY;
   const supplied = req.get("x-admin-key") || "";
   if (
@@ -1283,7 +1363,6 @@ app.post(
   }
 );
 
-
 /* GUDIYA TAXI PARTNER ADMIN API ROUTES */
 
 app.get("/api/admin/dashboard", requireAdmin, async (_req, res, next) => {
@@ -1329,7 +1408,7 @@ app.get("/api/admin/dashboard", requireAdmin, async (_req, res, next) => {
                 AND s.current_period_end > now()
             ) THEN 'paid' ELSE 'unpaid' END
           )='paid'
-        `)
+        `),
       ]);
 
     const totalUsers = Number(users.rows[0].total || 0);
@@ -1338,19 +1417,16 @@ app.get("/api/admin/dashboard", requireAdmin, async (_req, res, next) => {
       users: {
         total: totalUsers,
         paid: Number(paid.rows[0].total || 0),
-        unpaid: Math.max(
-          0,
-          totalUsers - Number(paid.rows[0].total || 0)
-        ),
-        active: Number(active.rows[0].total || 0)
+        unpaid: Math.max(0, totalUsers - Number(paid.rows[0].total || 0)),
+        active: Number(active.rows[0].total || 0),
       },
       documents: {
-        pending: Number(documents.rows[0].total || 0)
+        pending: Number(documents.rows[0].total || 0),
       },
       duties: duties.rows[0],
       payments: {
-        pending: Number(payments.rows[0].total || 0)
-      }
+        pending: Number(payments.rows[0].total || 0),
+      },
     });
   } catch (e) {
     next(e);
@@ -1359,9 +1435,12 @@ app.get("/api/admin/dashboard", requireAdmin, async (_req, res, next) => {
 
 app.get("/api/admin/users", requireAdmin, async (req, res, next) => {
   try {
-    const q = String(req.query.q || "").trim().slice(0, 100);
+    const q = String(req.query.q || "")
+      .trim()
+      .slice(0, 100);
 
-    const result = await pool.query(`
+    const result = await pool.query(
+      `
       SELECT u.id, u.name, u.phone, u.role_mode,
         u.driver_verification, u.vendor_verification, u.created_at,
         CASE
@@ -1389,7 +1468,9 @@ app.get("/api/admin/users", requireAdmin, async (req, res, next) => {
         OR u.id::text=$1)
       ORDER BY u.created_at DESC
       LIMIT 500
-    `, [q]);
+    `,
+      [q]
+    );
 
     res.json({ users: result.rows });
   } catch (e) {
@@ -1403,7 +1484,8 @@ app.get("/api/admin/users/:id", requireAdmin, async (req, res, next) => {
       return res.status(400).json({ error: "Invalid user ID" });
     }
 
-    const found = await pool.query(`
+    const found = await pool.query(
+      `
       SELECT u.id, u.name, u.phone, u.role_mode,
         u.driver_verification, u.vendor_verification, u.created_at,
         COALESCE(o.status, CASE WHEN EXISTS (
@@ -1417,37 +1499,48 @@ app.get("/api/admin/users/:id", requireAdmin, async (req, res, next) => {
       FROM users u
       LEFT JOIN admin_membership_overrides o ON o.user_id=u.id
       WHERE u.id=$1
-    `, [req.params.id]);
+    `,
+      [req.params.id]
+    );
 
     if (!found.rowCount) {
       return res.status(404).json({ error: "User not found" });
     }
 
     const [docs, duties, sessions] = await Promise.all([
-      pool.query(`
+      pool.query(
+        `
         SELECT id, document_type, status, created_at, reviewed_at
         FROM driver_documents
         WHERE user_id=$1 ORDER BY created_at DESC LIMIT 50
-      `, [req.params.id]),
-      pool.query(`
+      `,
+        [req.params.id]
+      ),
+      pool.query(
+        `
         SELECT id, pickup_city, drop_city, vehicle_type,
           duty_date, duty_time, status, created_at
         FROM duties
         WHERE user_id=$1 OR accepted_by_user_id=$1
         ORDER BY created_at DESC LIMIT 50
-      `, [req.params.id]),
-      pool.query(`
+      `,
+        [req.params.id]
+      ),
+      pool.query(
+        `
         SELECT created_at, last_seen_at, revoked_at
         FROM device_sessions
         WHERE user_id=$1 ORDER BY last_seen_at DESC LIMIT 20
-      `, [req.params.id])
+      `,
+        [req.params.id]
+      ),
     ]);
 
     res.json({
       user: found.rows[0],
       documents: docs.rows,
       duties: duties.rows,
-      sessions: sessions.rows
+      sessions: sessions.rows,
     });
   } catch (e) {
     next(e);
@@ -1459,7 +1552,8 @@ app.get("/api/admin/documents", requireAdmin, async (req, res, next) => {
     const status = String(req.query.status || "all");
     const type = String(req.query.type || "all");
 
-    const result = await pool.query(`
+    const result = await pool.query(
+      `
       SELECT d.id, d.user_id, d.document_type, d.status,
         d.created_at, d.reviewed_at,
         u.name AS user_name, u.phone, u.role_mode
@@ -1469,7 +1563,9 @@ app.get("/api/admin/documents", requireAdmin, async (req, res, next) => {
         AND ($2='all' OR d.document_type=$2)
       ORDER BY d.created_at DESC
       LIMIT 500
-    `, [status, type]);
+    `,
+      [status, type]
+    );
 
     res.json({ documents: result.rows });
   } catch (e) {
@@ -1479,11 +1575,14 @@ app.get("/api/admin/documents", requireAdmin, async (req, res, next) => {
 
 app.get("/api/admin/duties", requireAdmin, async (req, res, next) => {
   try {
-    const q = String(req.query.q || "").trim().slice(0, 100);
+    const q = String(req.query.q || "")
+      .trim()
+      .slice(0, 100);
     const status = String(req.query.status || "all");
     const role = String(req.query.role || "all");
 
-    const result = await pool.query(`
+    const result = await pool.query(
+      `
       SELECT d.id, d.user_id, d.pickup_city, d.drop_city,
         d.vehicle_type, d.role_posted_as, d.duty_date, d.duty_time,
         d.distance_km, d.payout_paise, d.status, d.created_at,
@@ -1501,7 +1600,9 @@ app.get("/api/admin/duties", requireAdmin, async (req, res, next) => {
         AND ($3='all' OR d.role_posted_as=$3)
       ORDER BY d.created_at DESC
       LIMIT 500
-    `, [q, status, role]);
+    `,
+      [q, status, role]
+    );
 
     res.json({ duties: result.rows });
   } catch (e) {
