@@ -1478,6 +1478,87 @@ app.get("/api/admin/users", requireAdmin, async (req, res, next) => {
   }
 });
 
+// Admin-only password reset. Keep this consistent with /api/auth/password/login:
+// passwords are stored as bcrypt hashes and old device sessions are revoked.
+app.post(
+  "/api/admin/users/:id/reset-password",
+  requireAdmin,
+  async (req, res, next) => {
+    try {
+      const id = String(req.params.id || "").trim();
+      const temporaryPassword =
+        typeof req.body?.temporaryPassword === "string"
+          ? req.body.temporaryPassword
+          : "";
+
+      if (!/^\d+$/.test(id) || Number(id) < 1) {
+        return res.status(400).json({ error: "Invalid user ID" });
+      }
+      if (
+        temporaryPassword.length < 8 ||
+        temporaryPassword.length > 72 ||
+        Buffer.byteLength(temporaryPassword, "utf8") > 72
+      ) {
+        return res.status(400).json({
+          error:
+            "Temporary password must be 8–72 characters and no more than 72 UTF-8 bytes",
+        });
+      }
+
+      // Match the registration/login implementation: bcrypt with cost factor 12.
+      const passwordHash = await bcrypt.hash(temporaryPassword, 12);
+      const client = await pool.connect();
+      try {
+        await client.query("BEGIN");
+        const found = await client.query(
+          "SELECT id, phone FROM users WHERE id=$1 FOR UPDATE",
+          [id]
+        );
+        if (!found.rowCount) {
+          await client.query("ROLLBACK");
+          return res.status(404).json({ error: "User not found" });
+        }
+
+        await client.query(
+          "UPDATE users SET password_hash=$1, updated_at=now() WHERE id=$2",
+          [passwordHash, id]
+        );
+        await client.query(
+          "UPDATE device_sessions SET revoked_at=now() WHERE user_id=$1 AND revoked_at IS NULL",
+          [id]
+        );
+        await client.query("DELETE FROM push_tokens WHERE user_id=$1", [id]);
+        await client.query(
+          "INSERT INTO audit_log(action,subject_type,subject_id,details) VALUES($1,$2,$3,$4)",
+          [
+            "admin_password_reset",
+            "user",
+            String(id),
+            JSON.stringify({
+              phone: found.rows[0].phone,
+              admin: req.admin?.username || "admin-api-key",
+            }),
+          ]
+        );
+        await client.query("COMMIT");
+        res.set("Cache-Control", "no-store");
+        return res.json({
+          ok: true,
+          message:
+            "Password reset successfully. Please log in with the temporary password.",
+        });
+      } catch (e) {
+        await client.query("ROLLBACK").catch(() => {});
+        throw e;
+      } finally {
+        client.release();
+      }
+    } catch (e) {
+      next(e);
+    }
+  }
+);
+
 app.get("/api/admin/users/:id", requireAdmin, async (req, res, next) => {
   try {
     if (!/^\d+$/.test(String(req.params.id))) {
