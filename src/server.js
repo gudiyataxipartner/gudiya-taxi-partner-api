@@ -1443,6 +1443,7 @@ app.get("/api/admin/users", requireAdmin, async (req, res, next) => {
       `
       SELECT u.id, u.name, u.phone, u.role_mode,
         u.driver_verification, u.vendor_verification, u.created_at,
+        o.status AS admin_override_status,
         CASE
           WHEN o.status IS NOT NULL THEN o.status
           WHEN EXISTS (
