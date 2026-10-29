@@ -313,6 +313,7 @@ function privateDuty(d) {
     pickupCity: d.pickup_city,
     dropCity: d.drop_city,
     vehicleType: d.vehicle_type,
+    tripType: d.trip_type || "one_way",
     dutyDate: d.duty_date,
     dutyTime: d.duty_time,
     distanceKm: d.distance_km,
@@ -755,6 +756,9 @@ app.post("/api/duties", requireAuth, async (req, res, next) => {
     const vehicle = String(req.body.vehicleType || "")
       .trim()
       .slice(0, 80);
+    const tripType = String(req.body.tripType || "one_way");
+    if (!["one_way", "round_trip", "local_booking"].includes(tripType))
+      return res.status(400).json({ error: "ड्यूटी का प्रकार सही नहीं है" });
     if (!pickup || !drop || !vehicle)
       return res
         .status(400)
@@ -774,9 +778,9 @@ app.post("/api/duties", requireAuth, async (req, res, next) => {
       return res.status(400).json({ error: "Invalid payout" });
     const r = await pool.query(
       `INSERT INTO duties(user_id,role_posted_as,pickup_city,pickup_address_private,drop_city,drop_address_private,
-      vehicle_type,duty_date,duty_time,payout_paise,notes_private,distance_km,distance_label)
-      VALUES($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11,NULL,'लगभग दूरी')
-      RETURNING id,pickup_city,drop_city,vehicle_type,duty_date,duty_time,distance_km,distance_label,created_at,status`,
+      vehicle_type,trip_type,duty_date,duty_time,payout_paise,notes_private,distance_km,distance_label)
+      VALUES($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11,$12,NULL,'लगभग दूरी')
+      RETURNING id,pickup_city,drop_city,vehicle_type,trip_type,duty_date,duty_time,distance_km,distance_label,created_at,status`,
       [
         req.auth.user_id,
         role,
@@ -785,6 +789,7 @@ app.post("/api/duties", requireAuth, async (req, res, next) => {
         drop,
         String(req.body.dropAddress || "").slice(0, 500),
         vehicle,
+        tripType,
         req.body.dutyDate || null,
         req.body.dutyTime || null,
         payout,
@@ -823,7 +828,7 @@ app.get("/api/duties", requireAuth, async (req, res, next) => {
       .trim()
       .slice(0, 120);
     const r = await pool.query(
-      `SELECT d.id,d.user_id,d.role_posted_as,d.pickup_city,d.pickup_address_private,d.drop_city,d.drop_address_private,d.vehicle_type,
+      `SELECT d.id,d.user_id,d.role_posted_as,d.pickup_city,d.pickup_address_private,d.drop_city,d.drop_address_private,d.vehicle_type,d.trip_type,
       d.duty_date,d.duty_time,d.payout_paise,d.notes_private,d.distance_km,d.distance_label,d.created_at,d.status,
       (d.user_id=$3) AS is_owner, (d.accepted_by_user_id=$3) AS accepted_by_me, u.name AS poster_name, u.phone AS poster_phone
       FROM duties d JOIN users u ON u.id=d.user_id WHERE d.status='open' AND ($1='' OR d.pickup_city ILIKE '%'||$1||'%')
@@ -876,6 +881,53 @@ app.get("/api/duties", requireAuth, async (req, res, next) => {
 });
 // A duty can be accepted by only one other logged-in account. The conditional UPDATE
 // is atomic, so simultaneous requests cannot reserve the same duty twice.
+// Only the owner can update their own duty. Once it is accepted, changes require cancelling/reposting.
+app.put("/api/duties/:id", requireAuth, async (req, res, next) => {
+  try {
+    const id = String(req.params.id || "");
+    if (!/^\d+$/.test(id)) return res.status(400).json({ error: "ड्यूटी ID सही नहीं है" });
+    const pickup = String(req.body.pickupCity || "").trim().slice(0, 120);
+    const drop = String(req.body.dropCity || "").trim().slice(0, 120);
+    const role = String(req.body.rolePostedAs || "driver");
+    const vehicle = String(req.body.vehicleType || "").trim().slice(0, 80);
+    const tripType = String(req.body.tripType || "one_way");
+    if (!pickup || !drop || !vehicle) return res.status(400).json({ error: "Pickup, drop और vehicle जरूरी हैं" });
+    if (!["driver", "vendor"].includes(role)) return res.status(400).json({ error: "Invalid role" });
+    if (!["one_way", "round_trip", "local_booking"].includes(tripType)) return res.status(400).json({ error: "ड्यूटी का प्रकार सही नहीं है" });
+    if (req.auth.role_mode !== "both" && req.auth.role_mode !== role) return res.status(403).json({ error: "इस भूमिका की अनुमति नहीं है" });
+    const payout = req.body.payoutRupees == null || req.body.payoutRupees === "" ? null : Math.round(Number(req.body.payoutRupees) * 100);
+    if (payout != null && (!Number.isFinite(payout) || payout < 0 || payout > 100000000)) return res.status(400).json({ error: "Invalid payout" });
+    const r = await pool.query(`UPDATE duties SET role_posted_as=$1,pickup_city=$2,pickup_address_private=$3,drop_city=$4,drop_address_private=$5,vehicle_type=$6,trip_type=$7,duty_date=$8,duty_time=$9,payout_paise=$10,notes_private=$11
+      WHERE id=$12 AND user_id=$13 AND status='open'
+      RETURNING id,pickup_city,drop_city,vehicle_type,trip_type,duty_date,duty_time,payout_paise,notes_private,created_at,status`,
+      [role,pickup,String(req.body.pickupAddress||"").slice(0,500),drop,String(req.body.dropAddress||"").slice(0,500),vehicle,tripType,req.body.dutyDate||null,req.body.dutyTime||null,payout,String(req.body.notes||"").slice(0,1000),id,req.auth.user_id]);
+    if (!r.rowCount) {
+      const existing = await pool.query("SELECT user_id,status FROM duties WHERE id=$1", [id]);
+      if (!existing.rowCount) return res.status(404).json({ error: "ड्यूटी नहीं मिली" });
+      if (String(existing.rows[0].user_id) !== String(req.auth.user_id)) return res.status(403).json({ error: "केवल ड्यूटी पोस्ट करने वाला इसे अपडेट कर सकता है" });
+      return res.status(409).json({ error: "यह ड्यूटी अब अपडेट नहीं हो सकती। स्वीकार होने के बाद बदलाव बंद हैं।" });
+    }
+    broadcastDutyUpdate();
+    return res.json({ duty: r.rows[0], message: "ड्यूटी अपडेट हो गई।" });
+  } catch (e) { next(e); }
+});
+app.post("/api/duties/:id/cancel", requireAuth, async (req, res, next) => {
+  try {
+    const id = String(req.params.id || "");
+    if (!/^\d+$/.test(id)) return res.status(400).json({ error: "ड्यूटी ID सही नहीं है" });
+    const r = await pool.query(`UPDATE duties SET status='cancelled' WHERE id=$1 AND user_id=$2 AND status IN ('open','accepted')
+      RETURNING id,pickup_city,drop_city,status,accepted_by_user_id`, [id,req.auth.user_id]);
+    if (!r.rowCount) {
+      const existing = await pool.query("SELECT user_id,status FROM duties WHERE id=$1", [id]);
+      if (!existing.rowCount) return res.status(404).json({ error: "ड्यूटी नहीं मिली" });
+      if (String(existing.rows[0].user_id) !== String(req.auth.user_id)) return res.status(403).json({ error: "केवल ड्यूटी पोस्ट करने वाला इसे कैंसल कर सकता है" });
+      return res.status(409).json({ error: "यह ड्यूटी पहले ही बुक, पूरी या कैंसल हो चुकी है" });
+    }
+    broadcastDutyUpdate();
+    if (r.rows[0].accepted_by_user_id) void sendPushToUserIds([r.rows[0].accepted_by_user_id], "ड्यूटी कैंसल हुई", `${r.rows[0].pickup_city} से ${r.rows[0].drop_city} की ड्यूटी पोस्ट करने वाले ने कैंसल कर दी है।`, { type: "duty_cancelled", dutyId: r.rows[0].id });
+    return res.json({ duty: r.rows[0], message: "ड्यूटी कैंसल हो गई।" });
+  } catch (e) { next(e); }
+});
 app.post("/api/duties/:id/accept", requireAuth, async (req, res, next) => {
   try {
     const id = String(req.params.id || "");
@@ -990,7 +1042,7 @@ app.get("/api/duties/accepted", requireAuth, async (req, res, next) => {
   try {
     const r = await pool.query(
       `SELECT d.id,d.user_id,d.role_posted_as,d.pickup_city,d.pickup_address_private,d.drop_city,d.drop_address_private,
-      d.vehicle_type,d.duty_date,d.duty_time,d.payout_paise,d.notes_private,d.distance_km,d.distance_label,d.created_at,d.status,
+      d.vehicle_type,d.trip_type,d.duty_date,d.duty_time,d.payout_paise,d.notes_private,d.distance_km,d.distance_label,d.created_at,d.status,
       (d.user_id=$1) AS is_owner, (d.accepted_by_user_id=$1) AS accepted_by_me, u.name AS poster_name, u.phone AS poster_phone
       FROM duties d JOIN users u ON u.id=d.user_id WHERE d.accepted_by_user_id=$1 ORDER BY d.created_at DESC LIMIT 100`,
       [req.auth.user_id]
@@ -1015,7 +1067,7 @@ app.get("/api/duties/accepted", requireAuth, async (req, res, next) => {
 app.get("/api/duties/mine", requireAuth, async (req, res, next) => {
   try {
     const r = await pool.query(
-      `SELECT id,role_posted_as,pickup_city,pickup_address_private,drop_city,drop_address_private,vehicle_type,duty_date,duty_time,payout_paise,notes_private,distance_km,distance_label,created_at,status,
+      `SELECT id,role_posted_as,pickup_city,pickup_address_private,drop_city,drop_address_private,vehicle_type,trip_type,duty_date,duty_time,payout_paise,notes_private,distance_km,distance_label,created_at,status,
       (user_id=$1) AS is_owner
       FROM duties WHERE user_id=$1 ORDER BY created_at DESC LIMIT 100`,
       [req.auth.user_id]
@@ -1501,8 +1553,7 @@ app.post(
         Buffer.byteLength(temporaryPassword, "utf8") > 72
       ) {
         return res.status(400).json({
-          error:
-            "Temporary password must be 8–72 characters and no more than 72 UTF-8 bytes",
+          error: "Temporary password must be 8–72 characters and no more than 72 UTF-8 bytes",
         });
       }
 
@@ -1545,8 +1596,7 @@ app.post(
         res.set("Cache-Control", "no-store");
         return res.json({
           ok: true,
-          message:
-            "Password reset successfully. Please log in with the temporary password.",
+          message: "Password reset successfully. Please log in with the temporary password.",
         });
       } catch (e) {
         await client.query("ROLLBACK").catch(() => {});
@@ -1752,6 +1802,9 @@ console.log("Loading database schema from:", schemaPath);
 const schemaSql = fs.readFileSync(schemaPath, "utf8");
 pool
   .query(schemaSql)
+  .then(() => pool.query("ALTER TABLE duties ADD COLUMN IF NOT EXISTS trip_type TEXT NOT NULL DEFAULT 'one_way'"))
+  .then(() => pool.query("ALTER TABLE duties DROP CONSTRAINT IF EXISTS duties_trip_type_check"))
+  .then(() => pool.query("ALTER TABLE duties ADD CONSTRAINT duties_trip_type_check CHECK (trip_type IN ('one_way','round_trip','local_booking'))"))
   .then(() =>
     pool.query("ALTER TABLE users ADD COLUMN IF NOT EXISTS password_hash TEXT")
   )
