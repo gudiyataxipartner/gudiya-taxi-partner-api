@@ -1610,6 +1610,66 @@ app.post(
   }
 );
 
+app.delete("/api/admin/users/:id", requireAdmin, async (req, res, next) => {
+  const id = String(req.params.id || "").trim();
+
+  if (!/^\d+$/.test(id) || Number(id) < 1) {
+    return res.status(400).json({ error: "Invalid user ID" });
+  }
+
+  const client = await pool.connect();
+
+  try {
+    await client.query("BEGIN");
+
+    const found = await client.query(
+      "SELECT id, name, phone FROM users WHERE id=$1 FOR UPDATE",
+      [id]
+    );
+
+    if (!found.rowCount) {
+      await client.query("ROLLBACK");
+      return res.status(404).json({ error: "User not found" });
+    }
+
+    const user = found.rows[0];
+
+    await client.query(
+      "INSERT INTO audit_log(action,subject_type,subject_id,details) VALUES($1,$2,$3,$4)",
+      [
+        "admin_user_deleted",
+        "user",
+        String(user.id),
+        JSON.stringify({
+          name: user.name,
+          phone: user.phone,
+          admin: req.admin?.username || "admin-api-key"
+        })
+      ]
+    );
+
+    await client.query("DELETE FROM users WHERE id=$1", [id]);
+    await client.query("COMMIT");
+
+    res.set("Cache-Control", "no-store");
+    return res.json({ ok: true, deletedUser: user });
+  } catch (e) {
+    try {
+      await client.query("ROLLBACK");
+    } catch (_) {}
+
+    if (e.code === "23503") {
+      return res.status(409).json({
+        error: "User-related data has a foreign-key dependency that is not configured for cascade deletion."
+      });
+    }
+
+    next(e);
+  } finally {
+    client.release();
+  }
+});
+
 app.get("/api/admin/users/:id", requireAdmin, async (req, res, next) => {
   try {
     if (!/^\d+$/.test(String(req.params.id))) {
