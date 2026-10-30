@@ -295,16 +295,85 @@ async function hasActiveMembership(userId) {
     [userId]
   );
   if (override.rowCount) return override.rows[0].status === "paid";
-  // Otherwise, only manually verified UPI subscriptions count. Legacy Razorpay rows are not
-  // automatically trusted after switching providers.
+  // Only verified UPI payments and server-issued referral rewards count.
   const r = await pool.query(
     `SELECT 1 FROM subscriptions
-     WHERE user_id=$1 AND provider='manual_upi' AND status='active'
-       AND provider_payment_id IS NOT NULL AND current_period_end > now()
+     WHERE user_id=$1 AND status='active' AND current_period_end > now()
+       AND (provider='referral_reward'
+         OR (provider='manual_upi' AND provider_payment_id IS NOT NULL))
      ORDER BY current_period_end DESC LIMIT 1`,
     [userId]
   );
   return !!r.rowCount;
+}
+
+async function qualifyReferralIfEligible(client, userId) {
+  const result = await client.query(
+    `UPDATE users
+       SET referral_qualified_at=now(), updated_at=now()
+     WHERE id=$1 AND referral_qualified_at IS NULL
+       AND first_paid_membership_at IS NOT NULL
+       AND (
+         (role_mode='driver' AND driver_verification='approved')
+         OR (role_mode='vendor' AND vendor_verification='approved')
+         OR (role_mode='both' AND driver_verification='approved' AND vendor_verification='approved')
+       )
+     RETURNING referred_by_user_id`,
+    [userId]
+  );
+  if (!result.rowCount || !result.rows[0].referred_by_user_id) return;
+  const referrerId = result.rows[0].referred_by_user_id;
+  const count = await client.query(
+    `SELECT COUNT(*)::int AS total FROM users
+     WHERE referred_by_user_id=$1 AND referral_qualified_at IS NOT NULL`,
+    [referrerId]
+  );
+  const total = Number(count.rows[0].total || 0);
+  const milestones =
+    total >= 50
+      ? [
+          { milestone: 15, months: 1 },
+          { milestone: 50, months: 2 },
+        ]
+      : total >= 15
+      ? [{ milestone: 15, months: 1 }]
+      : [];
+  for (const reward of milestones) {
+    const claimed = await client.query(
+      `INSERT INTO referral_reward_events(referrer_user_id,milestone,months_awarded)
+       VALUES($1,$2,$3) ON CONFLICT(referrer_user_id,milestone) DO NOTHING
+       RETURNING id`,
+      [referrerId, reward.milestone, reward.months]
+    );
+    if (!claimed.rowCount) continue;
+    const subscription = await client.query(
+      `INSERT INTO subscriptions(user_id,provider,plan_months,amount_rupees,status,current_period_end)
+       VALUES($1,'referral_reward',NULL,NULL,'active',
+         GREATEST(now(), COALESCE(
+           (SELECT MAX(current_period_end) FROM subscriptions
+            WHERE user_id=$1 AND status='active'
+              AND provider IN ('manual_upi','referral_reward')), now()
+         )) + ($2::text || ' months')::interval)
+       RETURNING id`,
+      [referrerId, reward.months]
+    );
+    await client.query(
+      `UPDATE referral_reward_events SET subscription_id=$3 WHERE referrer_user_id=$1 AND milestone=$2`,
+      [referrerId, reward.milestone, subscription.rows[0].id]
+    );
+    await client.query(
+      `INSERT INTO audit_log(action,subject_type,subject_id,details)
+       VALUES('referral_reward_issued','user',$1,$2)`,
+      [
+        String(referrerId),
+        JSON.stringify({
+          milestone: reward.milestone,
+          monthsAdded: reward.months,
+          qualifiedReferrals: total,
+        }),
+      ]
+    );
+  }
 }
 
 function privateDuty(d) {
@@ -348,6 +417,11 @@ app.post(
       const password = String(req.body.password || "");
       const role = String(req.body.roleMode || "both");
       const deviceId = String(req.body.deviceId || "").trim();
+      const referralCode = String(req.body.referralCode || "")
+        .trim()
+        .toUpperCase();
+      if (referralCode && !/^[A-Z0-9]{6,16}$/.test(referralCode))
+        return res.status(400).json({ error: "Referral Code सही नहीं है" });
       if (name.length < 2)
         return res.status(400).json({ error: "अपना नाम भरें" });
       if (password.length < 8 || password.length > 72)
@@ -373,10 +447,29 @@ app.post(
             error: "इस मोबाइल नंबर का अकाउंट पहले से है। लॉगिन करें।",
           });
         }
+        let referrerId = null;
+        if (referralCode) {
+          const referrer = await client.query(
+            "SELECT id FROM users WHERE referral_code=$1",
+            [referralCode]
+          );
+          if (!referrer.rowCount) {
+            await client.query("ROLLBACK");
+            return res
+              .status(400)
+              .json({
+                error: "Referral Code नहीं मिला। कृपया सही Code डालें।",
+              });
+          }
+          referrerId = referrer.rows[0].id;
+        }
+        const ownReferralCode =
+          "GTP" + crypto.randomBytes(5).toString("hex").toUpperCase();
         const created = await client.query(
-          `INSERT INTO users(phone,name,role_mode,password_hash) VALUES($1,$2,$3,$4)
-        RETURNING id,phone,name,role_mode,driver_verification,vendor_verification`,
-          [phone, name, role, passwordHash]
+          `INSERT INTO users(phone,name,role_mode,password_hash,referral_code,referred_by_user_id)
+           VALUES($1,$2,$3,$4,$5,$6)
+           RETURNING id,phone,name,role_mode,driver_verification,vendor_verification,referral_code`,
+          [phone, name, role, passwordHash, ownReferralCode, referrerId]
         );
         const user = created.rows[0];
         const sid = crypto.randomUUID();
@@ -885,48 +978,119 @@ app.get("/api/duties", requireAuth, async (req, res, next) => {
 app.put("/api/duties/:id", requireAuth, async (req, res, next) => {
   try {
     const id = String(req.params.id || "");
-    if (!/^\d+$/.test(id)) return res.status(400).json({ error: "ड्यूटी ID सही नहीं है" });
-    const pickup = String(req.body.pickupCity || "").trim().slice(0, 120);
-    const drop = String(req.body.dropCity || "").trim().slice(0, 120);
+    if (!/^\d+$/.test(id))
+      return res.status(400).json({ error: "ड्यूटी ID सही नहीं है" });
+    const pickup = String(req.body.pickupCity || "")
+      .trim()
+      .slice(0, 120);
+    const drop = String(req.body.dropCity || "")
+      .trim()
+      .slice(0, 120);
     const role = String(req.body.rolePostedAs || "driver");
-    const vehicle = String(req.body.vehicleType || "").trim().slice(0, 80);
+    const vehicle = String(req.body.vehicleType || "")
+      .trim()
+      .slice(0, 80);
     const tripType = String(req.body.tripType || "one_way");
-    if (!pickup || !drop || !vehicle) return res.status(400).json({ error: "Pickup, drop और vehicle जरूरी हैं" });
-    if (!["driver", "vendor"].includes(role)) return res.status(400).json({ error: "Invalid role" });
-    if (!["one_way", "round_trip", "local_booking"].includes(tripType)) return res.status(400).json({ error: "ड्यूटी का प्रकार सही नहीं है" });
-    if (req.auth.role_mode !== "both" && req.auth.role_mode !== role) return res.status(403).json({ error: "इस भूमिका की अनुमति नहीं है" });
-    const payout = req.body.payoutRupees == null || req.body.payoutRupees === "" ? null : Math.round(Number(req.body.payoutRupees) * 100);
-    if (payout != null && (!Number.isFinite(payout) || payout < 0 || payout > 100000000)) return res.status(400).json({ error: "Invalid payout" });
-    const r = await pool.query(`UPDATE duties SET role_posted_as=$1,pickup_city=$2,pickup_address_private=$3,drop_city=$4,drop_address_private=$5,vehicle_type=$6,trip_type=$7,duty_date=$8,duty_time=$9,payout_paise=$10,notes_private=$11
+    if (!pickup || !drop || !vehicle)
+      return res
+        .status(400)
+        .json({ error: "Pickup, drop और vehicle जरूरी हैं" });
+    if (!["driver", "vendor"].includes(role))
+      return res.status(400).json({ error: "Invalid role" });
+    if (!["one_way", "round_trip", "local_booking"].includes(tripType))
+      return res.status(400).json({ error: "ड्यूटी का प्रकार सही नहीं है" });
+    if (req.auth.role_mode !== "both" && req.auth.role_mode !== role)
+      return res.status(403).json({ error: "इस भूमिका की अनुमति नहीं है" });
+    const payout =
+      req.body.payoutRupees == null || req.body.payoutRupees === ""
+        ? null
+        : Math.round(Number(req.body.payoutRupees) * 100);
+    if (
+      payout != null &&
+      (!Number.isFinite(payout) || payout < 0 || payout > 100000000)
+    )
+      return res.status(400).json({ error: "Invalid payout" });
+    const r = await pool.query(
+      `UPDATE duties SET role_posted_as=$1,pickup_city=$2,pickup_address_private=$3,drop_city=$4,drop_address_private=$5,vehicle_type=$6,trip_type=$7,duty_date=$8,duty_time=$9,payout_paise=$10,notes_private=$11
       WHERE id=$12 AND user_id=$13 AND status='open'
       RETURNING id,pickup_city,drop_city,vehicle_type,trip_type,duty_date,duty_time,payout_paise,notes_private,created_at,status`,
-      [role,pickup,String(req.body.pickupAddress||"").slice(0,500),drop,String(req.body.dropAddress||"").slice(0,500),vehicle,tripType,req.body.dutyDate||null,req.body.dutyTime||null,payout,String(req.body.notes||"").slice(0,1000),id,req.auth.user_id]);
+      [
+        role,
+        pickup,
+        String(req.body.pickupAddress || "").slice(0, 500),
+        drop,
+        String(req.body.dropAddress || "").slice(0, 500),
+        vehicle,
+        tripType,
+        req.body.dutyDate || null,
+        req.body.dutyTime || null,
+        payout,
+        String(req.body.notes || "").slice(0, 1000),
+        id,
+        req.auth.user_id,
+      ]
+    );
     if (!r.rowCount) {
-      const existing = await pool.query("SELECT user_id,status FROM duties WHERE id=$1", [id]);
-      if (!existing.rowCount) return res.status(404).json({ error: "ड्यूटी नहीं मिली" });
-      if (String(existing.rows[0].user_id) !== String(req.auth.user_id)) return res.status(403).json({ error: "केवल ड्यूटी पोस्ट करने वाला इसे अपडेट कर सकता है" });
-      return res.status(409).json({ error: "यह ड्यूटी अब अपडेट नहीं हो सकती। स्वीकार होने के बाद बदलाव बंद हैं।" });
+      const existing = await pool.query(
+        "SELECT user_id,status FROM duties WHERE id=$1",
+        [id]
+      );
+      if (!existing.rowCount)
+        return res.status(404).json({ error: "ड्यूटी नहीं मिली" });
+      if (String(existing.rows[0].user_id) !== String(req.auth.user_id))
+        return res
+          .status(403)
+          .json({ error: "केवल ड्यूटी पोस्ट करने वाला इसे अपडेट कर सकता है" });
+      return res
+        .status(409)
+        .json({
+          error:
+            "यह ड्यूटी अब अपडेट नहीं हो सकती। स्वीकार होने के बाद बदलाव बंद हैं।",
+        });
     }
     broadcastDutyUpdate();
     return res.json({ duty: r.rows[0], message: "ड्यूटी अपडेट हो गई।" });
-  } catch (e) { next(e); }
+  } catch (e) {
+    next(e);
+  }
 });
 app.post("/api/duties/:id/cancel", requireAuth, async (req, res, next) => {
   try {
     const id = String(req.params.id || "");
-    if (!/^\d+$/.test(id)) return res.status(400).json({ error: "ड्यूटी ID सही नहीं है" });
-    const r = await pool.query(`UPDATE duties SET status='cancelled' WHERE id=$1 AND user_id=$2 AND status IN ('open','accepted')
-      RETURNING id,pickup_city,drop_city,status,accepted_by_user_id`, [id,req.auth.user_id]);
+    if (!/^\d+$/.test(id))
+      return res.status(400).json({ error: "ड्यूटी ID सही नहीं है" });
+    const r = await pool.query(
+      `UPDATE duties SET status='cancelled' WHERE id=$1 AND user_id=$2 AND status IN ('open','accepted')
+      RETURNING id,pickup_city,drop_city,status,accepted_by_user_id`,
+      [id, req.auth.user_id]
+    );
     if (!r.rowCount) {
-      const existing = await pool.query("SELECT user_id,status FROM duties WHERE id=$1", [id]);
-      if (!existing.rowCount) return res.status(404).json({ error: "ड्यूटी नहीं मिली" });
-      if (String(existing.rows[0].user_id) !== String(req.auth.user_id)) return res.status(403).json({ error: "केवल ड्यूटी पोस्ट करने वाला इसे कैंसल कर सकता है" });
-      return res.status(409).json({ error: "यह ड्यूटी पहले ही बुक, पूरी या कैंसल हो चुकी है" });
+      const existing = await pool.query(
+        "SELECT user_id,status FROM duties WHERE id=$1",
+        [id]
+      );
+      if (!existing.rowCount)
+        return res.status(404).json({ error: "ड्यूटी नहीं मिली" });
+      if (String(existing.rows[0].user_id) !== String(req.auth.user_id))
+        return res
+          .status(403)
+          .json({ error: "केवल ड्यूटी पोस्ट करने वाला इसे कैंसल कर सकता है" });
+      return res
+        .status(409)
+        .json({ error: "यह ड्यूटी पहले ही बुक, पूरी या कैंसल हो चुकी है" });
     }
     broadcastDutyUpdate();
-    if (r.rows[0].accepted_by_user_id) void sendPushToUserIds([r.rows[0].accepted_by_user_id], "ड्यूटी कैंसल हुई", `${r.rows[0].pickup_city} से ${r.rows[0].drop_city} की ड्यूटी पोस्ट करने वाले ने कैंसल कर दी है।`, { type: "duty_cancelled", dutyId: r.rows[0].id });
+    if (r.rows[0].accepted_by_user_id)
+      void sendPushToUserIds(
+        [r.rows[0].accepted_by_user_id],
+        "ड्यूटी कैंसल हुई",
+        `${r.rows[0].pickup_city} से ${r.rows[0].drop_city} की ड्यूटी पोस्ट करने वाले ने कैंसल कर दी है।`,
+        { type: "duty_cancelled", dutyId: r.rows[0].id }
+      );
     return res.json({ duty: r.rows[0], message: "ड्यूटी कैंसल हो गई।" });
-  } catch (e) { next(e); }
+  } catch (e) {
+    next(e);
+  }
 });
 app.post("/api/duties/:id/accept", requireAuth, async (req, res, next) => {
   try {
@@ -1082,6 +1246,44 @@ app.get("/api/duties/mine", requireAuth, async (req, res, next) => {
         notes: d.notes_private,
         detailsAvailable: true,
       })),
+    });
+  } catch (e) {
+    next(e);
+  }
+});
+
+app.get("/api/referrals", requireAuth, async (req, res, next) => {
+  try {
+    const user = await pool.query(
+      "SELECT referral_code FROM users WHERE id=$1",
+      [req.auth.user_id]
+    );
+    const stats = await pool.query(
+      `SELECT COUNT(*) FILTER (WHERE referral_qualified_at IS NOT NULL)::int AS successful,
+              COUNT(*) FILTER (WHERE referral_qualified_at IS NULL)::int AS pending
+       FROM users WHERE referred_by_user_id=$1`,
+      [req.auth.user_id]
+    );
+    const rewards = await pool.query(
+      `SELECT milestone,months_awarded,created_at FROM referral_reward_events
+       WHERE referrer_user_id=$1 ORDER BY milestone`,
+      [req.auth.user_id]
+    );
+    res.json({
+      referralCode: user.rows[0]?.referral_code || null,
+      successfulReferrals: stats.rows[0].successful,
+      pendingReferrals: stats.rows[0].pending,
+      nextMilestone:
+        Number(stats.rows[0].successful) >= 50
+          ? null
+          : Number(stats.rows[0].successful) >= 15
+          ? 50
+          : 15,
+      rewards: rewards.rows,
+      rewardPolicy: {
+        15: "1 month free",
+        50: "3 months total free (2 additional months at 50)",
+      },
     });
   } catch (e) {
     next(e);
@@ -1371,6 +1573,11 @@ app.post(
       }
       const p = found.rows[0];
       if (status === "approved") {
+        // Record the first genuinely admin-approved UPI membership payment.
+        await client.query(
+          "UPDATE users SET first_paid_membership_at=COALESCE(first_paid_membership_at,now()) WHERE id=$1",
+          [p.user_id]
+        );
         // Extends from the later of now or the user's existing verified manual-UPI expiry.
         await client.query(
           `INSERT INTO subscriptions(user_id,provider,provider_payment_id,plan_months,amount_rupees,status,current_period_end)
@@ -1380,6 +1587,8 @@ app.post(
           [p.user_id, "UPI:" + p.utr, p.plan_months, p.amount_rupees]
         );
       }
+      if (status === "approved")
+        await qualifyReferralIfEligible(client, p.user_id);
       await client.query(
         `UPDATE membership_payment_requests SET status=$1,admin_note=$2,reviewed_at=now(),reviewed_by='admin_api' WHERE id=$3`,
         [status, String(req.body.note || "").slice(0, 500), p.id]
@@ -1416,6 +1625,33 @@ app.post(
 );
 
 /* GUDIYA TAXI PARTNER ADMIN API ROUTES */
+
+app.get("/api/admin/referrals", requireAdmin, async (_req, res, next) => {
+  try {
+    const [summary, referrers, recent] = await Promise.all([
+      pool.query(
+        `SELECT COUNT(*)::int AS total_codes FROM users WHERE referral_code IS NOT NULL`
+      ),
+      pool.query(`SELECT u.id,u.name,u.phone,u.referral_code,
+        COUNT(r.id)::int AS total_referred,
+        COUNT(r.id) FILTER (WHERE r.referral_qualified_at IS NOT NULL)::int AS successful
+        FROM users u LEFT JOIN users r ON r.referred_by_user_id=u.id
+        GROUP BY u.id ORDER BY successful DESC,total_referred DESC LIMIT 300`),
+      pool.query(`SELECT r.id,r.name,r.phone,r.referral_qualified_at,
+        p.name AS referrer_name,p.phone AS referrer_phone
+        FROM users r LEFT JOIN users p ON p.id=r.referred_by_user_id
+        WHERE r.referred_by_user_id IS NOT NULL
+        ORDER BY r.created_at DESC LIMIT 300`),
+    ]);
+    res.json({
+      summary: summary.rows[0],
+      referrers: referrers.rows,
+      referrals: recent.rows,
+    });
+  } catch (e) {
+    next(e);
+  }
+});
 
 app.get("/api/admin/dashboard", requireAdmin, async (_req, res, next) => {
   try {
@@ -1454,10 +1690,9 @@ app.get("/api/admin/dashboard", requireAdmin, async (_req, res, next) => {
             CASE WHEN EXISTS (
               SELECT 1 FROM subscriptions s
               WHERE s.user_id=u.id
-                AND s.provider='manual_upi'
-                AND s.status='active'
-                AND s.provider_payment_id IS NOT NULL
-                AND s.current_period_end > now()
+                AND s.status='active' AND s.current_period_end > now()
+                AND (s.provider='referral_reward'
+                  OR (s.provider='manual_upi' AND s.provider_payment_id IS NOT NULL))
             ) THEN 'paid' ELSE 'unpaid' END
           )='paid'
         `),
@@ -1501,10 +1736,9 @@ app.get("/api/admin/users", requireAdmin, async (req, res, next) => {
           WHEN EXISTS (
             SELECT 1 FROM subscriptions s
             WHERE s.user_id=u.id
-              AND s.provider='manual_upi'
-              AND s.status='active'
-              AND s.provider_payment_id IS NOT NULL
-              AND s.current_period_end > now()
+              AND s.status='active' AND s.current_period_end > now()
+              AND (s.provider='referral_reward'
+                OR (s.provider='manual_upi' AND s.provider_payment_id IS NOT NULL))
           ) THEN 'paid'
           ELSE 'unpaid'
         END AS membership_status,
@@ -1553,7 +1787,8 @@ app.post(
         Buffer.byteLength(temporaryPassword, "utf8") > 72
       ) {
         return res.status(400).json({
-          error: "Temporary password must be 8–72 characters and no more than 72 UTF-8 bytes",
+          error:
+            "Temporary password must be 8–72 characters and no more than 72 UTF-8 bytes",
         });
       }
 
@@ -1596,7 +1831,8 @@ app.post(
         res.set("Cache-Control", "no-store");
         return res.json({
           ok: true,
-          message: "Password reset successfully. Please log in with the temporary password.",
+          message:
+            "Password reset successfully. Please log in with the temporary password.",
         });
       } catch (e) {
         await client.query("ROLLBACK").catch(() => {});
@@ -1643,8 +1879,8 @@ app.delete("/api/admin/users/:id", requireAdmin, async (req, res, next) => {
         JSON.stringify({
           name: user.name,
           phone: user.phone,
-          admin: req.admin?.username || "admin-api-key"
-        })
+          admin: req.admin?.username || "admin-api-key",
+        }),
       ]
     );
 
@@ -1660,7 +1896,8 @@ app.delete("/api/admin/users/:id", requireAdmin, async (req, res, next) => {
 
     if (e.code === "23503") {
       return res.status(409).json({
-        error: "User-related data has a foreign-key dependency that is not configured for cascade deletion."
+        error:
+          "User-related data has a foreign-key dependency that is not configured for cascade deletion.",
       });
     }
 
@@ -1683,10 +1920,9 @@ app.get("/api/admin/users/:id", requireAdmin, async (req, res, next) => {
         COALESCE(o.status, CASE WHEN EXISTS (
           SELECT 1 FROM subscriptions s
           WHERE s.user_id=u.id
-            AND s.provider='manual_upi'
-            AND s.status='active'
-            AND s.provider_payment_id IS NOT NULL
-            AND s.current_period_end > now()
+            AND s.status='active' AND s.current_period_end > now()
+            AND (s.provider='referral_reward'
+              OR (s.provider='manual_upi' AND s.provider_payment_id IS NOT NULL))
         ) THEN 'paid' ELSE 'unpaid' END) AS membership_status
       FROM users u
       LEFT JOIN admin_membership_overrides o ON o.user_id=u.id
@@ -1838,7 +2074,7 @@ app.get(
       res.set(
         "Content-Disposition",
         'attachment; filename="' +
-          String(doc.filename || "document").replace(/[\r\n"\\]/g, "_") + '"' ); res.set("Cache-Control", "no-store"); res.send(bytes); } catch (e) { next(e); } } ); app.post( "/api/admin/documents/:id/review", requireAdmin, async (req, res, next) => { try { const status = String(req.body.status || ""); if (!["approved", "rejected"].includes(status)) return res .status(400) .json({ error: "status must be approved or rejected" }); const client = await pool.connect(); try { await client.query("BEGIN"); const doc = await client.query( `UPDATE driver_documents SET status=$1,reviewer_note=$2,reviewed_at=now() WHERE id=$3 AND status='pending' RETURNING user_id`, [status, String(req.body.note || "").slice(0, 500), req.params.id] ); if (!doc.rowCount) { await client.query("ROLLBACK"); return res.status(404).json({ error: "Pending document not found" }); } const docType = await client.query( "SELECT document_type FROM driver_documents WHERE id=$1", [req.params.id] ); const category = docType.rows[0]?.document_type?.startsWith("vendor_") ? "vendor" : "driver"; const types = category === "vendor" ? ["vendor_aadhaar"] : ["aadhaar", "driving_licence", "vehicle_rc"]; const pending = await client.query( `SELECT count(*)::int AS n FROM driver_documents WHERE user_id=$1 AND document_type = ANY($2::text[]) AND status='pending'`, [doc.rows[0].user_id, types] ); const rejected = await client.query( `SELECT count(*)::int AS n FROM driver_documents WHERE user_id=$1 AND document_type = ANY($2::text[]) AND status='rejected'`, [doc.rows[0].user_id, types] ); const approved = await client.query( `SELECT count(*)::int AS n FROM driver_documents WHERE user_id=$1 AND document_type = ANY($2::text[]) AND status='approved'`, [doc.rows[0].user_id, types] ); let verify = "pending"; if (Number(rejected.rows[0].n) > 0) verify = "rejected"; else if ( Number(pending.rows[0].n) === 0 && Number(approved.rows[0].n) >= (category === "vendor" ? 1 : 3) ) verify = "approved"; const column = category === "vendor" ? "vendor_verification" : "driver_verification"; await client.query( `UPDATE users SET ${column}=$1,updated_at=now() WHERE id=$2`, [verify, doc.rows[0].user_id] ); await client.query( "INSERT INTO audit_log(action,subject_type,subject_id,details) VALUES($1,$2,$3,$4)", [ category + "_document_review", "driver_document", String(req.params.id), JSON.stringify({ status, verify }), ] ); await client.query("COMMIT"); void sendPushToUserIds( [doc.rows[0].user_id], status === "approved" ? "दस्तावेज़ स्वीकृत हुए" : "दस्तावेज़ में सुधार आवश्यक", status === "approved" ? "आपके दस्तावेज़ स्वीकृत कर दिए गए हैं।" : "आपके दस्तावेज़ अस्वीकृत हुए हैं। कृपया ऐप में स्थिति देखें।", { type: "document_status", status, category } ); res.json({ ok: true, category, verification: verify }); } catch (e) { await client.query("ROLLBACK"); throw e; } finally { client.release(); } } catch (e) { next(e); } } ); app.use((err, _req, res, _next) => { console.error(err.message); const status = Number(err.status) || 500; res .status(status) .json({ error: status < 500 ? err.message : "Server error" }); }); // Bootstrap the complete schema before accepting requests. This also fixes login's
+          String(doc.filename || "document").replace(/[\r\n"\\]/g, "_") + '"' ); res.set("Cache-Control", "no-store"); res.send(bytes); } catch (e) { next(e); } } ); app.post( "/api/admin/documents/:id/review", requireAdmin, async (req, res, next) => { try { const status = String(req.body.status || ""); if (!["approved", "rejected"].includes(status)) return res .status(400) .json({ error: "status must be approved or rejected" }); const client = await pool.connect(); try { await client.query("BEGIN"); const doc = await client.query( `UPDATE driver_documents SET status=$1,reviewer_note=$2,reviewed_at=now() WHERE id=$3 AND status='pending' RETURNING user_id`, [status, String(req.body.note || "").slice(0, 500), req.params.id] ); if (!doc.rowCount) { await client.query("ROLLBACK"); return res.status(404).json({ error: "Pending document not found" }); } const docType = await client.query( "SELECT document_type FROM driver_documents WHERE id=$1", [req.params.id] ); const category = docType.rows[0]?.document_type?.startsWith("vendor_") ? "vendor" : "driver"; const types = category === "vendor" ? ["vendor_aadhaar"] : ["aadhaar", "driving_licence", "vehicle_rc"]; const pending = await client.query( `SELECT count(*)::int AS n FROM driver_documents WHERE user_id=$1 AND document_type = ANY($2::text[]) AND status='pending'`, [doc.rows[0].user_id, types] ); const rejected = await client.query( `SELECT count(*)::int AS n FROM driver_documents WHERE user_id=$1 AND document_type = ANY($2::text[]) AND status='rejected'`, [doc.rows[0].user_id, types] ); const approved = await client.query( `SELECT count(*)::int AS n FROM driver_documents WHERE user_id=$1 AND document_type = ANY($2::text[]) AND status='approved'`, [doc.rows[0].user_id, types] ); let verify = "pending"; if (Number(rejected.rows[0].n) > 0) verify = "rejected"; else if ( Number(pending.rows[0].n) === 0 && Number(approved.rows[0].n) >= (category === "vendor" ? 1 : 3) ) verify = "approved"; const column = category === "vendor" ? "vendor_verification" : "driver_verification"; await client.query( `UPDATE users SET ${column}=$1,updated_at=now() WHERE id=$2`, [verify, doc.rows[0].user_id] ); await qualifyReferralIfEligible(client, doc.rows[0].user_id); await client.query( "INSERT INTO audit_log(action,subject_type,subject_id,details) VALUES($1,$2,$3,$4)", [ category + "_document_review", "driver_document", String(req.params.id), JSON.stringify({ status, verify }), ] ); await client.query("COMMIT"); void sendPushToUserIds( [doc.rows[0].user_id], status === "approved" ? "दस्तावेज़ स्वीकृत हुए" : "दस्तावेज़ में सुधार आवश्यक", status === "approved" ? "आपके दस्तावेज़ स्वीकृत कर दिए गए हैं।" : "आपके दस्तावेज़ अस्वीकृत हुए हैं। कृपया ऐप में स्थिति देखें।", { type: "document_status", status, category } ); res.json({ ok: true, category, verification: verify }); } catch (e) { await client.query("ROLLBACK"); throw e; } finally { client.release(); } } catch (e) { next(e); } } ); app.use((err, _req, res, _next) => { console.error(err.message); const status = Number(err.status) || 500; res .status(status) .json({ error: status < 500 ? err.message : "Server error" }); }); // Bootstrap the complete schema before accepting requests. This also fixes login's
 // generic Server error on a fresh Gudiya database where users/device_sessions did not exist.
 // Resolve schema.sql across the common Render layouts. The API entry point is
 // src/server.js and schema.sql should normally be at the repository root.
@@ -1862,11 +2098,65 @@ console.log("Loading database schema from:", schemaPath);
 const schemaSql = fs.readFileSync(schemaPath, "utf8");
 pool
   .query(schemaSql)
-  .then(() => pool.query("ALTER TABLE duties ADD COLUMN IF NOT EXISTS trip_type TEXT NOT NULL DEFAULT 'one_way'"))
-  .then(() => pool.query("ALTER TABLE duties DROP CONSTRAINT IF EXISTS duties_trip_type_check"))
-  .then(() => pool.query("ALTER TABLE duties ADD CONSTRAINT duties_trip_type_check CHECK (trip_type IN ('one_way','round_trip','local_booking'))"))
+  .then(() =>
+    pool.query(
+      "ALTER TABLE duties ADD COLUMN IF NOT EXISTS trip_type TEXT NOT NULL DEFAULT 'one_way'"
+    )
+  )
+  .then(() =>
+    pool.query(
+      "ALTER TABLE duties DROP CONSTRAINT IF EXISTS duties_trip_type_check"
+    )
+  )
+  .then(() =>
+    pool.query(
+      "ALTER TABLE duties ADD CONSTRAINT duties_trip_type_check CHECK (trip_type IN ('one_way','round_trip','local_booking'))"
+    )
+  )
   .then(() =>
     pool.query("ALTER TABLE users ADD COLUMN IF NOT EXISTS password_hash TEXT")
+  )
+  .then(() =>
+    pool.query("ALTER TABLE users ADD COLUMN IF NOT EXISTS referral_code TEXT")
+  )
+  .then(() =>
+    pool.query(
+      "ALTER TABLE users ADD COLUMN IF NOT EXISTS referred_by_user_id BIGINT REFERENCES users(id) ON DELETE SET NULL"
+    )
+  )
+  .then(() =>
+    pool.query(
+      "ALTER TABLE users ADD COLUMN IF NOT EXISTS first_paid_membership_at TIMESTAMPTZ"
+    )
+  )
+  .then(() =>
+    pool.query(
+      "ALTER TABLE users ADD COLUMN IF NOT EXISTS referral_qualified_at TIMESTAMPTZ"
+    )
+  )
+  .then(() =>
+    pool.query(`
+    UPDATE users SET referral_code='GTP' || upper(substr(md5(id::text || random()::text),1,10))
+    WHERE referral_code IS NULL
+  `)
+  )
+  .then(() =>
+    pool.query(
+      "CREATE UNIQUE INDEX IF NOT EXISTS users_referral_code_unique ON users(referral_code)"
+    )
+  )
+  .then(() =>
+    pool.query(`
+    CREATE TABLE IF NOT EXISTS referral_reward_events (
+      id BIGSERIAL PRIMARY KEY,
+      referrer_user_id BIGINT NOT NULL REFERENCES users(id) ON DELETE CASCADE,
+      milestone INTEGER NOT NULL CHECK (milestone IN (15,50)),
+      months_awarded INTEGER NOT NULL CHECK (months_awarded IN (1,2)),
+      subscription_id BIGINT REFERENCES subscriptions(id) ON DELETE SET NULL,
+      created_at TIMESTAMPTZ NOT NULL DEFAULT now(),
+      UNIQUE(referrer_user_id,milestone)
+    )
+  `)
   )
   .then(() =>
     pool.query(
