@@ -134,3 +134,26 @@ CREATE TABLE IF NOT EXISTS membership_upi_payments (
   reviewer_note TEXT
 );
 CREATE INDEX IF NOT EXISTS membership_upi_payments_pending ON membership_upi_payments(status, created_at DESC);
+
+-- Gudiya Taxi Partner referral programme (safe additive migration)
+ALTER TABLE users ADD COLUMN IF NOT EXISTS referral_code TEXT;
+ALTER TABLE users ADD COLUMN IF NOT EXISTS referred_by_user_id BIGINT REFERENCES users(id) ON DELETE SET NULL;
+ALTER TABLE users ADD COLUMN IF NOT EXISTS first_paid_membership_at TIMESTAMPTZ;
+ALTER TABLE users ADD COLUMN IF NOT EXISTS referral_qualified_at TIMESTAMPTZ;
+
+UPDATE users
+SET referral_code='GTP' || upper(substr(md5(id::text || random()::text),1,10))
+WHERE referral_code IS NULL;
+
+CREATE UNIQUE INDEX IF NOT EXISTS users_referral_code_unique ON users(referral_code);
+CREATE INDEX IF NOT EXISTS users_referred_by_user_id ON users(referred_by_user_id);
+
+CREATE TABLE IF NOT EXISTS referral_reward_events (
+  id BIGSERIAL PRIMARY KEY,
+  referrer_user_id BIGINT NOT NULL REFERENCES users(id) ON DELETE CASCADE,
+  milestone INTEGER NOT NULL CHECK (milestone IN (15,50)),
+  months_awarded INTEGER NOT NULL CHECK (months_awarded IN (1,2)),
+  subscription_id BIGINT REFERENCES subscriptions(id) ON DELETE SET NULL,
+  created_at TIMESTAMPTZ NOT NULL DEFAULT now(),
+  UNIQUE(referrer_user_id,milestone)
+);
