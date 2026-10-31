@@ -455,11 +455,9 @@ app.post(
           );
           if (!referrer.rowCount) {
             await client.query("ROLLBACK");
-            return res
-              .status(400)
-              .json({
-                error: "Referral Code नहीं मिला। कृपया सही Code डालें।",
-              });
+            return res.status(400).json({
+              error: "Referral Code नहीं मिला। कृपया सही Code डालें।",
+            });
           }
           referrerId = referrer.rows[0].id;
         }
@@ -1041,12 +1039,10 @@ app.put("/api/duties/:id", requireAuth, async (req, res, next) => {
         return res
           .status(403)
           .json({ error: "केवल ड्यूटी पोस्ट करने वाला इसे अपडेट कर सकता है" });
-      return res
-        .status(409)
-        .json({
-          error:
-            "यह ड्यूटी अब अपडेट नहीं हो सकती। स्वीकार होने के बाद बदलाव बंद हैं।",
-        });
+      return res.status(409).json({
+        error:
+          "यह ड्यूटी अब अपडेट नहीं हो सकती। स्वीकार होने के बाद बदलाव बंद हैं।",
+      });
     }
     broadcastDutyUpdate();
     return res.json({ duty: r.rows[0], message: "ड्यूटी अपडेट हो गई।" });
@@ -1583,7 +1579,7 @@ app.post(
           `INSERT INTO subscriptions(user_id,provider,provider_payment_id,plan_months,amount_rupees,status,current_period_end)
          VALUES($1,'manual_upi',$2,$3,$4,'active',
            GREATEST(now(), COALESCE((SELECT MAX(current_period_end) FROM subscriptions WHERE user_id=$1 AND provider='manual_upi' AND status='active'), now()))
-             + ($3::text || ' months')::interval)`,
+             + ($3::int * interval '1 month'))`,
           [p.user_id, "UPI:" + p.utr, p.plan_months, p.amount_rupees]
         );
       }
