@@ -1,3 +1,5 @@
+process.on("uncaughtException", (err) => console.error("FATAL STARTUP ERROR:", err.stack || err));
+process.on("unhandledRejection", (err) => console.error("UNHANDLED STARTUP ERROR:", err));
 require("dotenv").config();
 const express = require("express");
 const helmet = require("helmet");
