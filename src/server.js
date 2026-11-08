@@ -2156,7 +2156,7 @@ app.get("/api/admin/activity", requireAdmin, async (req, res, next) => {
       "SELECT id,action,subject_type,subject_id,details,created_at FROM audit_log ORDER BY created_at DESC LIMIT $1",
       [limit]
     );
-    res.json({ activities: r.rows });
+    res.json({ activities: r.rows, events: r.rows });
   } catch (e) {
     next(e);
   }
@@ -2175,6 +2175,93 @@ app.get("/api/admin/security", requireAdmin, async (_req, res, next) => {
     next(e);
   }
 });
+// Compatibility endpoints used by the Admin App's 8-feature update.
+// All routes remain protected by requireAdmin and only read existing production tables.
+app.get("/api/admin/analytics", requireAdmin, async (_req, res, next) => {
+  try {
+    const periods = await pool.query(`
+      SELECT period,
+        (SELECT COUNT(*)::int FROM users u WHERE u.created_at >= now() - p.window) AS registrations,
+        (SELECT COUNT(*)::int FROM duties d WHERE d.created_at >= now() - p.window) AS duties_posted,
+        (SELECT COUNT(*)::int FROM duties d WHERE d.created_at >= now() - p.window AND d.status IN ('booked','accepted','completed')) AS duties_booked,
+        (SELECT COUNT(*)::int FROM membership_payment_requests m WHERE m.created_at >= now() - p.window AND m.status = 'approved') AS payments_approved,
+        (SELECT COUNT(*)::int FROM membership_payment_requests m WHERE m.created_at >= now() - p.window AND m.status = 'pending') AS payments_pending
+      FROM (VALUES ('today', interval '1 day'), ('7_days', interval '7 days'), ('30_days', interval '30 days')) p(period, window)
+    `);
+    const summary = await pool.query(`
+      SELECT
+        (SELECT COUNT(*)::int FROM driver_documents WHERE status='pending') AS pending_verifications,
+        (SELECT COUNT(*)::int FROM membership_payment_requests WHERE status='pending') AS pending_payments,
+        (SELECT COUNT(*)::int FROM duties WHERE status='open') AS open_duties,
+        (SELECT COUNT(*)::int FROM users WHERE created_at >= now()-interval '1 day') AS new_users_today
+    `);
+    res.json({ periods: periods.rows, summary: summary.rows[0] || {} });
+  } catch (e) {
+    next(e);
+  }
+});
+
+app.get(
+  "/api/admin/security/sessions",
+  requireAdmin,
+  async (_req, res, next) => {
+    try {
+      const r = await pool.query(`
+      SELECT ds.user_id, u.name, u.phone, ds.device_id, ds.created_at, ds.last_seen_at, ds.revoked_at
+      FROM device_sessions ds JOIN users u ON u.id=ds.user_id
+      ORDER BY ds.last_seen_at DESC NULLS LAST LIMIT 300
+    `);
+      res.json({ sessions: r.rows });
+    } catch (e) {
+      next(e);
+    }
+  }
+);
+
+app.get("/api/admin/backup/export", requireAdmin, async (_req, res, next) => {
+  try {
+    // Export only tables that exist; no schema mutation and no destructive operations.
+    const candidates = [
+      "users",
+      "duties",
+      "subscriptions",
+      "membership_payment_requests",
+      "membership_upi_payments",
+      "driver_documents",
+      "device_sessions",
+      "audit_log",
+      "referral_reward_events",
+      "admin_membership_overrides",
+      "admin_notifications",
+      "push_tokens",
+    ];
+    const data = {
+      createdAt: new Date().toISOString(),
+      type: "logical-json-export",
+      warning:
+        "Sensitive data export. Store securely. This is not a managed PostgreSQL backup.",
+      tables: {},
+    };
+    for (const table of candidates) {
+      const exists = await pool.query("SELECT to_regclass($1) AS name", [
+        `public.${table}`,
+      ]);
+      if (!exists.rows[0]?.name) continue;
+      const result = await pool.query(`SELECT * FROM ${table} ORDER BY 1`);
+      data.tables[table] = result.rows;
+    }
+    const day = new Date().toISOString().slice(0, 10);
+    res.set(
+      "Content-Disposition",
+      `attachment; filename="gudiya-admin-backup-${day}.json"`
+    );
+    res.set("Cache-Control", "no-store");
+    res.type("application/json").send(JSON.stringify(data));
+  } catch (e) {
+    next(e);
+  }
+});
+
 app.get("/api/admin/notifications", requireAdmin, async (_req, res, next) => {
   try {
     const r = await pool.query(
