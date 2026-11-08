@@ -258,6 +258,23 @@ app.post("/api/admin/auth/login", adminLoginLimiter, async (req, res) => {
       jwtSecret,
       { expiresIn: "12h", issuer: "gudiya-taxi-partner-admin" }
     );
+    pool
+      .query(
+        `INSERT INTO audit_log(action,subject_type,subject_id,details)
+       VALUES('admin_login','admin',$1,$2)`,
+        [
+          configuredUsername,
+          JSON.stringify({
+            ip: String(
+              req.headers["x-forwarded-for"] || req.socket.remoteAddress || ""
+            ).slice(0, 120),
+            userAgent: String(req.headers["user-agent"] || "").slice(0, 300),
+          }),
+        ]
+      )
+      .catch((error) =>
+        console.error("Could not record admin login:", error.message)
+      );
     return res.json({ token, expiresIn: 43200, username: configuredUsername });
   } catch (error) {
     console.error("Admin login failed:", error.message);
@@ -1397,12 +1414,16 @@ app.get("/api/membership", requireAuth, async (req, res, next) => {
       };
     } else if (
       subscription &&
-      subscription.provider !== "manual_upi" &&
+      !["manual_upi", "admin_extension", "referral_reward"].includes(
+        subscription.provider
+      ) &&
       subscription.status === "active"
     ) {
       subscription = { ...subscription, status: "payment_required" };
     } else if (
-      subscription?.provider === "manual_upi" &&
+      ["manual_upi", "admin_extension", "referral_reward"].includes(
+        subscription?.provider
+      ) &&
       subscription.status === "active" &&
       new Date(subscription.current_period_end).getTime() <= Date.now()
     ) {
@@ -1664,64 +1685,63 @@ app.get("/api/admin/referrals", requireAdmin, async (_req, res, next) => {
 
 app.get("/api/admin/dashboard", requireAdmin, async (_req, res, next) => {
   try {
-    const [users, active, documents, duties, payments, paid] =
-      await Promise.all([
-        pool.query(`SELECT COUNT(*)::int AS total FROM users`),
-        pool.query(`
-          SELECT COUNT(DISTINCT user_id)::int AS total
-          FROM device_sessions
-          WHERE revoked_at IS NULL
-            AND last_seen_at > now() - interval '30 days'
-        `),
-        pool.query(`
-          SELECT COUNT(*)::int AS total
-          FROM driver_documents WHERE status='pending'
-        `),
-        pool.query(`
-          SELECT COUNT(*)::int AS total,
-            COUNT(*) FILTER (WHERE status='open')::int AS open,
-            COUNT(*) FILTER (WHERE status='accepted')::int AS accepted,
-            COUNT(*) FILTER (WHERE status='booked')::int AS booked,
-            COUNT(*) FILTER (WHERE status='completed')::int AS completed,
-            COUNT(*) FILTER (WHERE status='cancelled')::int AS cancelled
-          FROM duties
-        `),
-        pool.query(`
-          SELECT COUNT(*)::int AS total
-          FROM membership_payment_requests WHERE status='pending'
-        `),
-        pool.query(`
-          SELECT COUNT(*)::int AS total
-          FROM users u
-          LEFT JOIN admin_membership_overrides o ON o.user_id=u.id
-          WHERE COALESCE(
-            o.status,
-            CASE WHEN EXISTS (
-              SELECT 1 FROM subscriptions s
-              WHERE s.user_id=u.id
-                AND s.status='active' AND s.current_period_end > now()
-                AND (s.provider='referral_reward'
-                  OR (s.provider='manual_upi' AND s.provider_payment_id IS NOT NULL))
-            ) THEN 'paid' ELSE 'unpaid' END
-          )='paid'
-        `),
-      ]);
-
-    const totalUsers = Number(users.rows[0].total || 0);
-
+    const [
+      users,
+      active,
+      documents,
+      duties,
+      payments,
+      paid,
+      userPeriods,
+      dutyPeriods,
+      paymentPeriods,
+    ] = await Promise.all([
+      pool.query(`SELECT COUNT(*)::int AS total FROM users`),
+      pool.query(
+        `SELECT COUNT(DISTINCT user_id)::int AS total FROM device_sessions WHERE revoked_at IS NULL AND last_seen_at > now()-interval '30 days'`
+      ),
+      pool.query(
+        `SELECT COUNT(*)::int AS total FROM driver_documents WHERE status='pending'`
+      ),
+      pool.query(`SELECT COUNT(*)::int AS total,
+        COUNT(*) FILTER (WHERE status='open')::int AS open,
+        COUNT(*) FILTER (WHERE status='accepted')::int AS accepted,
+        COUNT(*) FILTER (WHERE status='booked')::int AS booked,
+        COUNT(*) FILTER (WHERE status='completed')::int AS completed,
+        COUNT(*) FILTER (WHERE status='cancelled')::int AS cancelled FROM duties`),
+      pool.query(
+        `SELECT COUNT(*)::int AS total FROM membership_payment_requests WHERE status='pending'`
+      ),
+      pool.query(`SELECT COUNT(*)::int AS total FROM users u LEFT JOIN admin_membership_overrides o ON o.user_id=u.id
+        WHERE COALESCE(o.status,CASE WHEN EXISTS(SELECT 1 FROM subscriptions s WHERE s.user_id=u.id
+          AND s.status='active' AND s.current_period_end>now()
+          AND (s.provider='referral_reward' OR s.provider='admin_extension' OR (s.provider='manual_upi' AND s.provider_payment_id IS NOT NULL)))
+          THEN 'paid' ELSE 'unpaid' END)='paid'`),
+      pool.query(`SELECT COUNT(*) FILTER(WHERE created_at>=date_trunc('day',now()))::int AS today,
+        COUNT(*) FILTER(WHERE created_at>=now()-interval '7 days')::int AS last7days,
+        COUNT(*) FILTER(WHERE created_at>=now()-interval '30 days')::int AS last30days FROM users`),
+      pool.query(`SELECT COUNT(*) FILTER(WHERE created_at>=date_trunc('day',now()))::int AS today,
+        COUNT(*) FILTER(WHERE created_at>=now()-interval '7 days')::int AS last7days,
+        COUNT(*) FILTER(WHERE created_at>=now()-interval '30 days')::int AS last30days FROM duties`),
+      pool.query(`SELECT COUNT(*) FILTER(WHERE created_at>=date_trunc('day',now()))::int AS today,
+        COUNT(*) FILTER(WHERE created_at>=now()-interval '7 days')::int AS last7days,
+        COUNT(*) FILTER(WHERE created_at>=now()-interval '30 days')::int AS last30days FROM membership_payment_requests`),
+    ]);
+    const totalUsers = Number(users.rows[0].total || 0),
+      paidUsers = Number(paid.rows[0].total || 0);
     res.json({
       users: {
         total: totalUsers,
-        paid: Number(paid.rows[0].total || 0),
-        unpaid: Math.max(0, totalUsers - Number(paid.rows[0].total || 0)),
+        paid: paidUsers,
+        unpaid: Math.max(0, totalUsers - paidUsers),
         active: Number(active.rows[0].total || 0),
+        registrations: userPeriods.rows[0],
       },
-      documents: {
-        pending: Number(documents.rows[0].total || 0),
-      },
-      duties: duties.rows[0],
+      documents: { pending: Number(documents.rows[0].total || 0) },
+      duties: { ...duties.rows[0], created: dutyPeriods.rows[0] },
       payments: {
         pending: Number(payments.rows[0].total || 0),
+        requests: paymentPeriods.rows[0],
       },
     });
   } catch (e) {
@@ -1734,41 +1754,57 @@ app.get("/api/admin/users", requireAdmin, async (req, res, next) => {
     const q = String(req.query.q || "")
       .trim()
       .slice(0, 100);
-
+    const membership = ["all", "paid", "unpaid"].includes(
+      String(req.query.membership || "all")
+    )
+      ? String(req.query.membership || "all")
+      : "all";
+    const activity = ["all", "active", "inactive"].includes(
+      String(req.query.activity || "all")
+    )
+      ? String(req.query.activity || "all")
+      : "all";
+    const role = ["all", "driver", "vendor", "both"].includes(
+      String(req.query.role || "all")
+    )
+      ? String(req.query.role || "all")
+      : "all";
+    const verification = [
+      "all",
+      "pending",
+      "approved",
+      "rejected",
+      "not_submitted",
+    ].includes(String(req.query.verification || "all"))
+      ? String(req.query.verification || "all")
+      : "all";
     const result = await pool.query(
       `
-      SELECT u.id, u.name, u.phone, u.role_mode,
-        u.driver_verification, u.vendor_verification, u.created_at,
+      SELECT u.id,u.name,u.phone,u.role_mode,u.driver_verification,u.vendor_verification,u.created_at,
         o.status AS admin_override_status,
-        CASE
-          WHEN o.status IS NOT NULL THEN o.status
-          WHEN EXISTS (
-            SELECT 1 FROM subscriptions s
-            WHERE s.user_id=u.id
-              AND s.status='active' AND s.current_period_end > now()
-              AND (s.provider='referral_reward'
-                OR (s.provider='manual_upi' AND s.provider_payment_id IS NOT NULL))
-          ) THEN 'paid'
-          ELSE 'unpaid'
-        END AS membership_status,
-        CASE WHEN EXISTS (
-          SELECT 1 FROM device_sessions ds
-          WHERE ds.user_id=u.id
-            AND ds.revoked_at IS NULL
-            AND ds.last_seen_at > now() - interval '30 days'
-        ) THEN 'active' ELSE 'inactive' END AS login_status
-      FROM users u
-      LEFT JOIN admin_membership_overrides o ON o.user_id=u.id
-      WHERE ($1='' OR u.name ILIKE '%' || $1 || '%'
-        OR u.phone ILIKE '%' || $1 || '%'
-        OR u.id::text=$1)
-      ORDER BY u.created_at DESC
-      LIMIT 500
-    `,
-      [q]
+        CASE WHEN o.status IS NOT NULL THEN o.status
+          WHEN EXISTS(SELECT 1 FROM subscriptions s WHERE s.user_id=u.id AND s.status='active'
+            AND s.current_period_end>now() AND (s.provider='referral_reward'
+            OR (s.provider='manual_upi' AND s.provider_payment_id IS NOT NULL))) THEN 'paid' ELSE 'unpaid' END AS membership_status,
+        CASE WHEN EXISTS(SELECT 1 FROM device_sessions ds WHERE ds.user_id=u.id AND ds.revoked_at IS NULL
+          AND ds.last_seen_at>now()-interval '30 days') THEN 'active' ELSE 'inactive' END AS login_status
+      FROM users u LEFT JOIN admin_membership_overrides o ON o.user_id=u.id
+      WHERE ($1='' OR u.name ILIKE '%'||$1||'%' OR u.phone ILIKE '%'||$1||'%' OR u.id::text=$1)
+        AND ($2='all' OR u.role_mode=$2)
+        AND ($3='all' OR (CASE WHEN o.status IS NOT NULL THEN o.status
+          WHEN EXISTS(SELECT 1 FROM subscriptions s WHERE s.user_id=u.id AND s.status='active'
+            AND s.current_period_end>now() AND (s.provider='referral_reward'
+            OR (s.provider='manual_upi' AND s.provider_payment_id IS NOT NULL))) THEN 'paid' ELSE 'unpaid' END)=$3)
+        AND ($4='all' OR (CASE WHEN EXISTS(SELECT 1 FROM device_sessions ds WHERE ds.user_id=u.id
+          AND ds.revoked_at IS NULL AND ds.last_seen_at>now()-interval '30 days') THEN 'active' ELSE 'inactive' END)=$4)
+        AND ($5='all' OR u.driver_verification=$5 OR u.vendor_verification=$5)
+      ORDER BY u.created_at DESC LIMIT 500`,
+      [q, role, membership, activity, verification]
     );
-
-    res.json({ users: result.rows });
+    res.json({
+      users: result.rows,
+      filters: { q, membership, activity, role, verification },
+    });
   } catch (e) {
     next(e);
   }
@@ -2047,40 +2083,254 @@ app.get("/api/admin/duties", requireAdmin, async (req, res, next) => {
   }
 });
 
-/* END GUDIYA TAXI PARTNER ADMIN API ROUTES */
-
-// Admin endpoints: protect with a separate high-entropy key configured only on the server.
-app.get(
-  "/api/admin/documents/pending",
+// Admin membership extension, audit trail, security view, in-app notifications and CSV exports.
+app.post(
+  "/api/admin/users/:id/membership-extend",
   requireAdmin,
-  async (_req, res, next) => {
+  async (req, res, next) => {
+    const userId = String(req.params.id || ""),
+      months = Number(req.body.months),
+      note = String(req.body.note || "").slice(0, 500);
+    if (!/^\d+$/.test(userId) || ![1, 3, 6, 12].includes(months))
+      return res
+        .status(400)
+        .json({ error: "User ID या अवधि सही नहीं है (1, 3, 6, 12 महीने)।" });
+    const client = await pool.connect();
     try {
-      const r =
-        await pool.query(`SELECT id,user_id,document_type,status,created_at FROM driver_documents
-      WHERE status='pending' ORDER BY created_at ASC LIMIT 200`);
-      res.json({ documents: r.rows });
+      await client.query("BEGIN");
+      const user = await client.query(
+        "SELECT id FROM users WHERE id=$1 FOR UPDATE",
+        [userId]
+      );
+      if (!user.rowCount) {
+        await client.query("ROLLBACK");
+        return res.status(404).json({ error: "User नहीं मिला" });
+      }
+      const sub = await client.query(
+        `INSERT INTO subscriptions(user_id,provider,plan_months,amount_rupees,status,current_period_end)
+      VALUES($1,'admin_extension',$2,0,'active',GREATEST(now(),COALESCE((SELECT MAX(current_period_end)
+      FROM subscriptions WHERE user_id=$1 AND status='active' AND current_period_end>now()),now()))+($2::text||' months')::interval)
+      RETURNING id,current_period_end`,
+        [userId, months]
+      );
+      await client.query(
+        "DELETE FROM admin_membership_overrides WHERE user_id=$1",
+        [userId]
+      );
+      await client.query(
+        `INSERT INTO audit_log(action,subject_type,subject_id,details) VALUES('admin_membership_extended','user',$1,$2)`,
+        [
+          userId,
+          JSON.stringify({
+            months,
+            note,
+            admin: req.admin?.username || "admin-api-key",
+          }),
+        ]
+      );
+      await client.query("COMMIT");
+      void sendPushToUserIds(
+        [userId],
+        "Membership बढ़ाई गई",
+        `आपकी सदस्यता ${months} महीने बढ़ा दी गई है।`,
+        { type: "membership_extended", months }
+      );
+      res.json({
+        ok: true,
+        months,
+        expiresAt: sub.rows[0].current_period_end,
+        message: "Membership अवधि बढ़ा दी गई।",
+      });
+    } catch (e) {
+      await client.query("ROLLBACK").catch(() => {});
+      next(e);
+    } finally {
+      client.release();
+    }
+  }
+);
+app.get("/api/admin/activity", requireAdmin, async (req, res, next) => {
+  try {
+    const limit = Math.min(500, Math.max(1, Number(req.query.limit) || 100));
+    const r = await pool.query(
+      "SELECT id,action,subject_type,subject_id,details,created_at FROM audit_log ORDER BY created_at DESC LIMIT $1",
+      [limit]
+    );
+    res.json({ activities: r.rows });
+  } catch (e) {
+    next(e);
+  }
+});
+app.get("/api/admin/security", requireAdmin, async (_req, res, next) => {
+  try {
+    const [sessions, events] = await Promise.all([
+      pool.query(`SELECT ds.id,ds.user_id,u.name,u.phone,ds.device_id,ds.created_at,ds.last_seen_at,ds.revoked_at
+        FROM device_sessions ds JOIN users u ON u.id=ds.user_id ORDER BY ds.last_seen_at DESC LIMIT 300`),
+      pool.query(`SELECT id,action,subject_id,details,created_at FROM audit_log
+        WHERE action IN ('admin_login','admin_password_reset','admin_membership_override_paid','admin_membership_override_unpaid')
+        ORDER BY created_at DESC LIMIT 200`),
+    ]);
+    res.json({ sessions: sessions.rows, adminEvents: events.rows });
+  } catch (e) {
+    next(e);
+  }
+});
+app.get("/api/admin/notifications", requireAdmin, async (_req, res, next) => {
+  try {
+    const r = await pool.query(
+      "SELECT id,title,body,kind,is_read,created_at FROM admin_notifications ORDER BY created_at DESC LIMIT 100"
+    );
+    res.json({ notifications: r.rows });
+  } catch (e) {
+    next(e);
+  }
+});
+app.post("/api/admin/notifications", requireAdmin, async (req, res, next) => {
+  try {
+    const title = String(req.body.title || "")
+        .trim()
+        .slice(0, 120),
+      body = String(req.body.body || "")
+        .trim()
+        .slice(0, 1000),
+      kind = String(req.body.kind || "info").slice(0, 40);
+    if (!title || !body)
+      return res.status(400).json({ error: "Title और message जरूरी हैं" });
+    const r = await pool.query(
+      "INSERT INTO admin_notifications(title,body,kind) VALUES($1,$2,$3) RETURNING id,title,body,kind,is_read,created_at",
+      [title, body, kind]
+    );
+    await pool.query(
+      "INSERT INTO audit_log(action,subject_type,subject_id,details) VALUES('admin_notification_created','admin',$1,$2)",
+      [req.admin?.username || "admin-api-key", JSON.stringify({ title, kind })]
+    );
+    res.status(201).json({ notification: r.rows[0] });
+  } catch (e) {
+    next(e);
+  }
+});
+app.post(
+  "/api/admin/notifications/:id/read",
+  requireAdmin,
+  async (req, res, next) => {
+    try {
+      const r = await pool.query(
+        "UPDATE admin_notifications SET is_read=true WHERE id=$1 RETURNING id,is_read",
+        [req.params.id]
+      );
+      if (!r.rowCount)
+        return res.status(404).json({ error: "Notification नहीं मिली" });
+      res.json({ ok: true, notification: r.rows[0] });
     } catch (e) {
       next(e);
     }
   }
 );
-app.get(
-  "/api/admin/documents/:id/content",
+function csvCell(value) {
+  return '"' + String(value == null ? "" : value).replace(/"/g, '""') + '"'; } function sendCsv(res, filename, headers, rows) { const lines = [ headers.map(csvCell).join(","), ...rows.map((row) => row.map(csvCell).join(",")), ]; res.set("Content-Type", "text/csv; charset=utf-8"); res.set("Content-Disposition", `attachment; filename="${filename}"`); res.send("\\uFEFF" + lines.join("\\r\\n")); } app.get( "/api/admin/export/users.csv", requireAdmin, async (_req, res, next) => { try { const r = await pool.query(`SELECT u.id,u.name,u.phone,u.role_mode,u.driver_verification,u.vendor_verification,u.created_at, COALESCE(o.status,CASE WHEN EXISTS(SELECT 1 FROM subscriptions s WHERE s.user_id=u.id AND s.status='active' AND s.current_period_end>now() AND (s.provider='referral_reward' OR s.provider='admin_extension' OR (s.provider='manual_upi' AND s.provider_payment_id IS NOT NULL))) THEN 'paid' ELSE 'unpaid' END) AS membership_status FROM users u LEFT JOIN admin_membership_overrides o ON o.user_id=u.id ORDER BY u.created_at DESC LIMIT 10000`); sendCsv( res, "gudiya-users.csv", [ "ID", "Name", "Phone", "Role", "Driver Verification", "Vendor Verification", "Joined", "Membership", ], r.rows.map((x) => [ x.id, x.name, x.phone, x.role_mode, x.driver_verification, x.vendor_verification, x.created_at, x.membership_status, ]) ); } catch (e) { next(e); } } ); app.get( "/api/admin/export/duties.csv", requireAdmin, async (_req, res, next) => { try { const r = await pool.query(`SELECT d.id,d.pickup_city,d.drop_city,d.vehicle_type,d.trip_type,d.duty_date,d.duty_time,d.status, d.payout_paise,u.name,u.phone,d.created_at FROM duties d JOIN users u ON u.id=d.user_id ORDER BY d.created_at DESC LIMIT 10000`); sendCsv( res, "gudiya-duties.csv", [ "Duty ID", "Pickup", "Drop", "Vehicle", "Trip", "Date", "Time", "Status", "Payout Rupees", "Posted By", "Phone", "Created", ], r.rows.map((x) => [ x.id, x.pickup_city, x.drop_city, x.vehicle_type, x.trip_type, x.duty_date, x.duty_time, x.status, x.payout_paise == null ? "" : Number(x.payout_paise) / 100, x.name, x.phone, x.created_at, ]) ); } catch (e) { next(e); } } ); app.get( "/api/admin/export/activity.csv", requireAdmin, async (_req, res, next) => { try { const r = await pool.query( "SELECT action,subject_type,subject_id,details,created_at FROM audit_log ORDER BY created_at DESC LIMIT 10000" ); sendCsv( res, "gudiya-admin-activity.csv", ["Action", "Subject Type", "Subject ID", "Details", "Created"], r.rows.map((x) => [ x.action, x.subject_type, x.subject_id, JSON.stringify(x.details), x.created_at, ]) ); } catch (e) { next(e); } } ); /* END GUDIYA TAXI PARTNER ADMIN API ROUTES */ // Admin endpoints: protect with a separate high-entropy key configured only on the server. app.get( "/api/admin/documents/pending", requireAdmin, async (_req, res, next) => { try { const r = await pool.query(`SELECT id,user_id,document_type,status,created_at FROM driver_documents WHERE status='pending' ORDER BY created_at ASC LIMIT 200`); res.json({ documents: r.rows }); } catch (e) { next(e); } } ); app.get( "/api/admin/documents/:id/content", requireAdmin, async (req, res, next) => { try { const r = await pool.query( "SELECT document_type,encrypted_payload FROM driver_documents WHERE id=$1", [req.params.id] ); if (!r.rowCount || !r.rows[0].encrypted_payload) return res.status(404).json({ error: "Encrypted document not found" }); const doc = JSON.parse( decryptDocument(r.rows[0].encrypted_payload).toString("utf8") ); const bytes = Buffer.from(doc.dataBase64, "base64"); res.set("Content-Type", doc.mime || "application/octet-stream"); res.set( "Content-Disposition", 'attachment; filename="' + String(doc.filename || "document").replace(/[\r\n"\\]/g, "_") +
+          '"'
+      );
+      res.set("Cache-Control", "no-store");
+      res.send(bytes);
+    } catch (e) {
+      next(e);
+    }
+  }
+);
+app.post(
+  "/api/admin/documents/:id/review",
   requireAdmin,
   async (req, res, next) => {
     try {
-      const r = await pool.query(
-        "SELECT document_type,encrypted_payload FROM driver_documents WHERE id=$1",
-        [req.params.id]
-      );
-      if (!r.rowCount || !r.rows[0].encrypted_payload)
-        return res.status(404).json({ error: "Encrypted document not found" });
-      const doc = JSON.parse(
-        decryptDocument(r.rows[0].encrypted_payload).toString("utf8")
-      );
-      const bytes = Buffer.from(doc.dataBase64, "base64");
-      res.set("Content-Type", doc.mime || "application/octet-stream");
-      res.set(
-        "Content-Disposition",
-        'attachment; filename="' +
-          String(doc.filename || "document").replace(/[\r\n"\\]/g, "_") + '"' ); res.set("Cache-Control", "no-store"); res.send(bytes); } catch (e) { next(e); } } ); app.post( "/api/admin/documents/:id/review", requireAdmin, async (req, res, next) => { try { const status = String(req.body.status || ""); if (!["approved", "rejected"].includes(status)) return res .status(400) .json({ error: "status must be approved or rejected" }); const client = await pool.connect(); try { await client.query("BEGIN"); const doc = await client.query( `UPDATE driver_documents SET status=$1,reviewer_note=$2,reviewed_at=now() WHERE id=$3 AND status='pending' RETURNING user_id`, [status, String(req.body.note || "").slice(0, 500), req.params.id] ); if (!doc.rowCount) { await client.query("ROLLBACK"); return res.status(404).json({ error: "Pending document not found" }); } const docType = await client.query( "SELECT document_type FROM driver_documents WHERE id=$1", [req.params.id] ); const category = docType.rows[0]?.document_type?.startsWith("vendor_") ? "vendor" : "driver"; const types = category === "vendor" ? ["vendor_aadhaar"] : ["aadhaar", "driving_licence", "vehicle_rc"]; const pending = await client.query( `SELECT count(*)::int AS n FROM driver_documents WHERE user_id=$1 AND document_type = ANY($2::text[]) AND status='pending'`, [doc.rows[0].user_id, types] ); const rejected = await client.query( `SELECT count(*)::int AS n FROM driver_documents WHERE user_id=$1 AND document_type = ANY($2::text[]) AND status='rejected'`, [doc.rows[0].user_id, types] ); const approved = await client.query( `SELECT count(*)::int AS n FROM driver_documents WHERE user_id=$1 AND document_type = ANY($2::text[]) AND status='approved'`, [doc.rows[0].user_id, types] ); let verify = "pending"; if (Number(rejected.rows[0].n) > 0) verify = "rejected"; else if ( Number(pending.rows[0].n) === 0 && Number(approved.rows[0].n) >= (category === "vendor" ? 1 : 3) ) verify = "approved"; const column = category === "vendor" ? "vendor_verification" : "driver_verification"; await client.query( `UPDATE users SET ${column}=$1,updated_at=now() WHERE id=$2`, [verify, doc.rows[0].user_id] ); await qualifyReferralIfEligible(client, doc.rows[0].user_id); await client.query( "INSERT INTO audit_log(action,subject_type,subject_id,details) VALUES($1,$2,$3,$4)", [ category + "_document_review", "driver_document", String(req.params.id), JSON.stringify({ status, verify }), ] ); await client.query("COMMIT"); void sendPushToUserIds( [doc.rows[0].user_id], status === "approved" ? "दस्तावेज़ स्वीकृत हुए" : "दस्तावेज़ में सुधार आवश्यक", status === "approved" ? "आपके दस्तावेज़ स्वीकृत कर दिए गए हैं।" : "आपके दस्तावेज़ अस्वीकृत हुए हैं। कृपया ऐप में स्थिति देखें।", { type: "document_status", status, category } ); res.json({ ok: true, category, verification: verify }); } catch (e) { await client.query("ROLLBACK"); throw e; } finally { client.release(); } } catch (e) { next(e); } } ); app.use((err, _req, res, _next) => { console.error(err.message); const status = Number(err.status) || 500; res .status(status) .json({ error: status < 500 ? err.message : "Server error" }); }); // Bootstrap the complete schema before accepting requests. // Serialize startup migrations across overlapping Render instances to prevent DDL deadlocks. const schemaCandidates = [ path.join(__dirname, "schema.sql"), path.join(__dirname, "..", "schema.sql"), path.join(process.cwd(), "schema.sql"), path.join(process.cwd(), "src", "schema.sql"), ]; const schemaPath = schemaCandidates.find((candidate) => fs.existsSync(candidate) ); if (!schemaPath) { throw new Error( "schema.sql not found. Checked: " + schemaCandidates.join(", ") + ". Ensure schema.sql is committed to the deployed repository root." ); } async function initializeDatabase() { const client = await pool.connect(); let transactionOpen = false; try { await client.query("BEGIN"); transactionOpen = true; // All app instances use the same transaction-scoped lock key. // A second instance waits here instead of running ALTER/CREATE concurrently. await client.query("SELECT pg_advisory_xact_lock($1)", [741029316]); console.log("Loading database schema from:", schemaPath); const schemaSql = fs.readFileSync(schemaPath, "utf8"); await client.query(schemaSql); await client.query( "ALTER TABLE duties ADD COLUMN IF NOT EXISTS trip_type TEXT NOT NULL DEFAULT 'one_way'" ); await client.query( "ALTER TABLE duties DROP CONSTRAINT IF EXISTS duties_trip_type_check" ); await client.query( "ALTER TABLE duties ADD CONSTRAINT duties_trip_type_check CHECK (trip_type IN ('one_way','round_trip','local_booking'))" ); await client.query( "ALTER TABLE users ADD COLUMN IF NOT EXISTS password_hash TEXT" ); await client.query( "ALTER TABLE users ADD COLUMN IF NOT EXISTS referral_code TEXT" ); await client.query( "ALTER TABLE users ADD COLUMN IF NOT EXISTS referred_by_user_id BIGINT REFERENCES users(id) ON DELETE SET NULL" ); await client.query( "ALTER TABLE users ADD COLUMN IF NOT EXISTS first_paid_membership_at TIMESTAMPTZ" ); await client.query( "ALTER TABLE users ADD COLUMN IF NOT EXISTS referral_qualified_at TIMESTAMPTZ" ); await client.query(` UPDATE users SET referral_code='GTP' || upper(substr(md5(id::text || random()::text),1,10)) WHERE referral_code IS NULL `); await client.query( "CREATE UNIQUE INDEX IF NOT EXISTS users_referral_code_unique ON users(referral_code)" ); await client.query(` CREATE TABLE IF NOT EXISTS referral_reward_events ( id BIGSERIAL PRIMARY KEY, referrer_user_id BIGINT NOT NULL REFERENCES users(id) ON DELETE CASCADE, milestone INTEGER NOT NULL CHECK (milestone IN (15,50)), months_awarded INTEGER NOT NULL CHECK (months_awarded IN (1,2)), subscription_id BIGINT REFERENCES subscriptions(id) ON DELETE SET NULL, created_at TIMESTAMPTZ NOT NULL DEFAULT now(), UNIQUE(referrer_user_id,milestone) ) `); await client.query( "ALTER TABLE users ADD COLUMN IF NOT EXISTS vendor_verification TEXT NOT NULL DEFAULT 'not_submitted'" ); await client.query( "ALTER TABLE driver_documents ADD COLUMN IF NOT EXISTS encrypted_payload TEXT" ); await client.query( "ALTER TABLE driver_documents DROP CONSTRAINT IF EXISTS driver_documents_document_type_check" ); await client.query( "ALTER TABLE driver_documents ADD CONSTRAINT driver_documents_document_type_check CHECK (document_type IN ('aadhaar','vendor_aadhaar','driving_licence','vehicle_rc','vendor_gst','vendor_pan'))" ); await client.query(` CREATE TABLE IF NOT EXISTS membership_payment_requests ( id BIGSERIAL PRIMARY KEY, user_id BIGINT NOT NULL REFERENCES users(id) ON DELETE CASCADE, plan_months INTEGER NOT NULL CHECK (plan_months IN (1,3,6)), amount_rupees INTEGER NOT NULL CHECK (amount_rupees IN (51,151,301)), utr VARCHAR(40) NOT NULL UNIQUE, status TEXT NOT NULL DEFAULT 'pending' CHECK (status IN ('pending','approved','rejected')), admin_note TEXT, created_at TIMESTAMPTZ NOT NULL DEFAULT now(), reviewed_at TIMESTAMPTZ, reviewed_by TEXT ) `); await client.query(` CREATE TABLE IF NOT EXISTS admin_membership_overrides ( user_id BIGINT PRIMARY KEY REFERENCES users(id) ON DELETE CASCADE, status TEXT NOT NULL CHECK (status IN ('paid','unpaid')), note TEXT NOT NULL DEFAULT '', updated_at TIMESTAMPTZ NOT NULL DEFAULT now() ) `); await client.query("COMMIT"); transactionOpen = false; console.log("Database schema initialized successfully."); } catch (error) { if (transactionOpen) { try { await client.query("ROLLBACK"); } catch (_) {} } throw error; } finally { client.release(); } } async function startServerWithDatabaseRetry() { // HTTP listener is already active; initialize the database in the background. let attempt = 0; while (true) { attempt += 1; try { console.log(`Starting database initialization attempt ${attempt}...`); await initializeDatabase(); console.log("Database initialization completed. API is ready."); return; } catch (error) { console.error( `Database initialization attempt ${attempt} failed:`, JSON.stringify({ code: error.code || "NO_CODE", message: error.message || String(error), detail: error.detail || null, hint: error.hint || null, table: error.table || null, constraint: error.constraint || null, stack: error.stack || null, }) ); const waitMs = Math.min(attempt * 5000, 30000); console.warn( `Database initialization will retry in ${waitMs / 1000} seconds.` ); await new Promise((resolve) => setTimeout(resolve, waitMs)); } } } startServerWithDatabaseRetry();
+      const status = String(req.body.status || "");
+      if (!["approved", "rejected"].includes(status))
+        return res
+          .status(400)
+          .json({ error: "status must be approved or rejected" });
+      const client = await pool.connect();
+      try {
+        await client.query("BEGIN");
+        const doc = await client.query(
+          `UPDATE driver_documents SET status=$1,reviewer_note=$2,reviewed_at=now() WHERE id=$3 AND status='pending' RETURNING user_id`,
+          [status, String(req.body.note || "").slice(0, 500), req.params.id]
+        );
+        if (!doc.rowCount) {
+          await client.query("ROLLBACK");
+          return res.status(404).json({ error: "Pending document not found" });
+        }
+        const docType = await client.query(
+          "SELECT document_type FROM driver_documents WHERE id=$1",
+          [req.params.id]
+        );
+        const category = docType.rows[0]?.document_type?.startsWith("vendor_")
+          ? "vendor"
+          : "driver";
+        const types =
+          category === "vendor"
+            ? ["vendor_aadhaar"]
+            : ["aadhaar", "driving_licence", "vehicle_rc"];
+        const pending = await client.query(
+          `SELECT count(*)::int AS n FROM driver_documents WHERE user_id=$1 AND document_type = ANY($2::text[]) AND status='pending'`,
+          [doc.rows[0].user_id, types]
+        );
+        const rejected = await client.query(
+          `SELECT count(*)::int AS n FROM driver_documents WHERE user_id=$1 AND document_type = ANY($2::text[]) AND status='rejected'`,
+          [doc.rows[0].user_id, types]
+        );
+        const approved = await client.query(
+          `SELECT count(*)::int AS n FROM driver_documents WHERE user_id=$1 AND document_type = ANY($2::text[]) AND status='approved'`,
+          [doc.rows[0].user_id, types]
+        );
+        let verify = "pending";
+        if (Number(rejected.rows[0].n) > 0) verify = "rejected";
+        else if (
+          Number(pending.rows[0].n) === 0 &&
+          Number(approved.rows[0].n) >= (category === "vendor" ? 1 : 3)
+        )
+          verify = "approved";
+        const column =
+          category === "vendor" ? "vendor_verification" : "driver_verification";
+        await client.query(
+          `UPDATE users SET ${column}=$1,updated_at=now() WHERE id=$2`,
+          [verify, doc.rows[0].user_id]
+        );
+        await qualifyReferralIfEligible(client, doc.rows[0].user_id);
+        await client.query(
+          "INSERT INTO audit_log(action,subject_type,subject_id,details) VALUES($1,$2,$3,$4)",
+          [
+            category + "_document_review",
+            "driver_document",
+            String(req.params.id),
+            JSON.stringify({ status, verify }),
+          ]
+        );
+        await client.query("COMMIT");
+        void sendPushToUserIds(
+          [doc.rows[0].user_id],
+          status === "approved"
+            ? "दस्तावेज़ स्वीकृत हुए"
+            : "दस्तावेज़ में सुधार आवश्यक",
+          status === "approved"
+            ? "आपके दस्तावेज़ स्वीकृत कर दिए गए हैं।"
+            : "आपके दस्तावेज़ अस्वीकृत हुए हैं। कृपया ऐप में स्थिति देखें।",
+          { type: "document_status", status, category }
+        );
+        res.json({ ok: true, category, verification: verify });
+      } catch (e) {
+        await client.query("ROLLBACK");
+        throw e;
+      } finally {
+        client.release();
+      }
+    } catch (e) {
+      next(e);
+    }
+  }
+);
+app.use((err, _req, res, _next) => {
+  console.error(err.message);
+  const status = Number(err.status) || 500;
+  res
+    .status(status)
+    .json({ error: status < 500 ? err.message : "Server error" });
+}); // Bootstrap the complete schema before accepting requests. // Serialize startup migrations across overlapping Render instances to prevent DDL deadlocks. const schemaCandidates = [ path.join(__dirname, "schema.sql"), path.join(__dirname, "..", "schema.sql"), path.join(process.cwd(), "schema.sql"), path.join(process.cwd(), "src", "schema.sql"), ]; const schemaPath = schemaCandidates.find((candidate) => fs.existsSync(candidate) ); if (!schemaPath) { throw new Error( "schema.sql not found. Checked: " + schemaCandidates.join(", ") + ". Ensure schema.sql is committed to the deployed repository root." ); } async function initializeDatabase() { const client = await pool.connect(); let transactionOpen = false; try { await client.query("BEGIN"); transactionOpen = true; // All app instances use the same transaction-scoped lock key. // A second instance waits here instead of running ALTER/CREATE concurrently. await client.query("SELECT pg_advisory_xact_lock($1)", [741029316]); console.log("Loading database schema from:", schemaPath); const schemaSql = fs.readFileSync(schemaPath, "utf8"); await client.query(schemaSql); await client.query( "ALTER TABLE duties ADD COLUMN IF NOT EXISTS trip_type TEXT NOT NULL DEFAULT 'one_way'" ); await client.query( "ALTER TABLE duties DROP CONSTRAINT IF EXISTS duties_trip_type_check" ); await client.query( "ALTER TABLE duties ADD CONSTRAINT duties_trip_type_check CHECK (trip_type IN ('one_way','round_trip','local_booking'))" ); await client.query( "ALTER TABLE users ADD COLUMN IF NOT EXISTS password_hash TEXT" ); await client.query( "ALTER TABLE users ADD COLUMN IF NOT EXISTS referral_code TEXT" ); await client.query( "ALTER TABLE users ADD COLUMN IF NOT EXISTS referred_by_user_id BIGINT REFERENCES users(id) ON DELETE SET NULL" ); await client.query( "ALTER TABLE users ADD COLUMN IF NOT EXISTS first_paid_membership_at TIMESTAMPTZ" ); await client.query( "ALTER TABLE users ADD COLUMN IF NOT EXISTS referral_qualified_at TIMESTAMPTZ" ); await client.query(` UPDATE users SET referral_code='GTP' || upper(substr(md5(id::text || random()::text),1,10)) WHERE referral_code IS NULL `); await client.query( "CREATE UNIQUE INDEX IF NOT EXISTS users_referral_code_unique ON users(referral_code)" ); await client.query(` CREATE TABLE IF NOT EXISTS referral_reward_events ( id BIGSERIAL PRIMARY KEY, referrer_user_id BIGINT NOT NULL REFERENCES users(id) ON DELETE CASCADE, milestone INTEGER NOT NULL CHECK (milestone IN (15,50)), months_awarded INTEGER NOT NULL CHECK (months_awarded IN (1,2)), subscription_id BIGINT REFERENCES subscriptions(id) ON DELETE SET NULL, created_at TIMESTAMPTZ NOT NULL DEFAULT now(), UNIQUE(referrer_user_id,milestone) ) `); await client.query( "ALTER TABLE users ADD COLUMN IF NOT EXISTS vendor_verification TEXT NOT NULL DEFAULT 'not_submitted'" ); await client.query( "ALTER TABLE driver_documents ADD COLUMN IF NOT EXISTS encrypted_payload TEXT" ); await client.query( "ALTER TABLE driver_documents DROP CONSTRAINT IF EXISTS driver_documents_document_type_check" ); await client.query( "ALTER TABLE driver_documents ADD CONSTRAINT driver_documents_document_type_check CHECK (document_type IN ('aadhaar','vendor_aadhaar','driving_licence','vehicle_rc','vendor_gst','vendor_pan'))" ); await client.query(` CREATE TABLE IF NOT EXISTS membership_payment_requests ( id BIGSERIAL PRIMARY KEY, user_id BIGINT NOT NULL REFERENCES users(id) ON DELETE CASCADE, plan_months INTEGER NOT NULL CHECK (plan_months IN (1,3,6)), amount_rupees INTEGER NOT NULL CHECK (amount_rupees IN (51,151,301)), utr VARCHAR(40) NOT NULL UNIQUE, status TEXT NOT NULL DEFAULT 'pending' CHECK (status IN ('pending','approved','rejected')), admin_note TEXT, created_at TIMESTAMPTZ NOT NULL DEFAULT now(), reviewed_at TIMESTAMPTZ, reviewed_by TEXT ) `); await client.query(` CREATE TABLE IF NOT EXISTS admin_membership_overrides ( user_id BIGINT PRIMARY KEY REFERENCES users(id) ON DELETE CASCADE, status TEXT NOT NULL CHECK (status IN ('paid','unpaid')), note TEXT NOT NULL DEFAULT '', updated_at TIMESTAMPTZ NOT NULL DEFAULT now() ) `); await client.query("CREATE TABLE IF NOT EXISTS admin_notifications (id BIGSERIAL PRIMARY KEY, title TEXT NOT NULL, body TEXT NOT NULL, kind TEXT NOT NULL DEFAULT 'info', is_read BOOLEAN NOT NULL DEFAULT false, created_at TIMESTAMPTZ NOT NULL DEFAULT now())"); await client.query("COMMIT"); transactionOpen = false; console.log("Database schema initialized successfully."); } catch (error) { if (transactionOpen) { try { await client.query("ROLLBACK"); } catch (_) {} } throw error; } finally { client.release(); } } async function startServerWithDatabaseRetry() { // HTTP listener is already active; initialize the database in the background. let attempt = 0; while (true) { attempt += 1; try { console.log(`Starting database initialization attempt ${attempt}...`); await initializeDatabase(); console.log("Database initialization completed. API is ready."); return; } catch (error) { console.error( `Database initialization attempt ${attempt} failed:`, JSON.stringify({ code: error.code || "NO_CODE", message: error.message || String(error), detail: error.detail || null, hint: error.hint || null, table: error.table || null, constraint: error.constraint || null, stack: error.stack || null, }) ); const waitMs = Math.min(attempt * 5000, 30000); console.warn( `Database initialization will retry in ${waitMs / 1000} seconds.` ); await new Promise((resolve) => setTimeout(resolve, waitMs)); } } } startServerWithDatabaseRetry();
