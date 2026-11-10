@@ -2181,12 +2181,12 @@ app.get("/api/admin/analytics", requireAdmin, async (_req, res, next) => {
   try {
     const periods = await pool.query(`
       SELECT period,
-        (SELECT COUNT(*)::int FROM users u WHERE u.created_at >= now() - p.window) AS registrations,
-        (SELECT COUNT(*)::int FROM duties d WHERE d.created_at >= now() - p.window) AS duties_posted,
-        (SELECT COUNT(*)::int FROM duties d WHERE d.created_at >= now() - p.window AND d.status IN ('booked','accepted','completed')) AS duties_booked,
+        (SELECT COUNT(*)::int FROM users u WHERE u.created_at >= now() - p.period_window) AS registrations,
+        (SELECT COUNT(*)::int FROM duties d WHERE d.created_at >= now() - p.period_window) AS duties_posted,
+        (SELECT COUNT(*)::int FROM duties d WHERE d.created_at >= now() - p.period_window AND d.status IN ('booked','accepted','completed')) AS duties_booked,
         (SELECT COUNT(*)::int FROM membership_payment_requests m WHERE m.created_at >= now() - p.window AND m.status = 'approved') AS payments_approved,
         (SELECT COUNT(*)::int FROM membership_payment_requests m WHERE m.created_at >= now() - p.window AND m.status = 'pending') AS payments_pending
-      FROM (VALUES ('today', interval '1 day'), ('7_days', interval '7 days'), ('30_days', interval '30 days')) p(period, window)
+      FROM (VALUES ('today', interval '1 day'), ('7_days', interval '7 days'), ('30_days', interval '30 days')) p(period, period_window)
     `);
     const summary = await pool.query(`
       SELECT
