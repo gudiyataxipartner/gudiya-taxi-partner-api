@@ -4,19 +4,23 @@
   "private": true,
   "description": "Gudiya Taxi Partner API for Android app",
   "main": "src/server.js",
-  "scripts": {"start":"node src/server.js", "dev":"node --watch src/server.js", "check":"node --check src/server.js"},
-  "engines": {"node": ">=20"},
+  "scripts": {
+    "start": "node src/server.js",
+    "dev": "node --watch src/server.js",
+    "check": "node --check src/server.js"
+  },
+  "engines": { "node": ">=20" },
   "dependencies": {
-    "bcryptjs":"^2.4.3",
-    "cors":"^2.8.5",
-    "dotenv":"^16.4.7",
-    "express":"^4.21.2",
+    "bcryptjs": "^2.4.3",
+    "cors": "^2.8.5",
+    "dotenv": "^16.4.7",
+    "express": "^4.21.2",
     "firebase-admin": "^13.5.0",
-    "express-rate-limit":"^7.5.0",
-    "helmet":"^8.0.0",
-    "jsonwebtoken":"^9.0.2",
-    "pg":"^8.13.1",
-    "razorpay":"^2.9.5",
-    "twilio":"^5.4.0"
+    "express-rate-limit": "^7.5.0",
+    "helmet": "^8.0.0",
+    "jsonwebtoken": "^9.0.2",
+    "pg": "^8.13.1",
+    "razorpay": "^2.9.5",
+    "twilio": "^5.4.0"
   }
 }
