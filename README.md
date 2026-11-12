@@ -1,1 +1,0 @@
-# gudiya-taxi-partner-api
