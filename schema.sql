@@ -157,3 +157,14 @@ CREATE TABLE IF NOT EXISTS referral_reward_events (
   created_at TIMESTAMPTZ NOT NULL DEFAULT now(),
   UNIQUE(referrer_user_id,milestone)
 );
+
+
+-- Admin app notification inbox.
+CREATE TABLE IF NOT EXISTS admin_notifications (
+  id BIGSERIAL PRIMARY KEY,
+  title TEXT NOT NULL,
+  body TEXT NOT NULL,
+  kind TEXT NOT NULL DEFAULT 'info',
+  is_read BOOLEAN NOT NULL DEFAULT false,
+  created_at TIMESTAMPTZ NOT NULL DEFAULT now()
+);
