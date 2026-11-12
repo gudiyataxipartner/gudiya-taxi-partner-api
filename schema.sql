@@ -37,8 +37,14 @@ CREATE TABLE IF NOT EXISTS duties (
   distance_km NUMERIC(8,1),
   distance_label TEXT NOT NULL DEFAULT 'लगभग दूरी',
   created_at TIMESTAMPTZ NOT NULL DEFAULT now(),
-  status TEXT NOT NULL DEFAULT 'open' CHECK (status IN ('open','accepted','completed','cancelled'))
+  status TEXT NOT NULL DEFAULT 'open' CHECK (status IN ('open','accepted','completed','cancelled')),
+  source_type TEXT,
+  source_group TEXT,
+  source_poster_name TEXT,
+  source_poster_phone TEXT,
+  source_message_hash TEXT
 );
+CREATE UNIQUE INDEX IF NOT EXISTS duties_source_message_hash_unique ON duties(source_message_hash) WHERE source_message_hash IS NOT NULL;
 CREATE INDEX IF NOT EXISTS duties_open_created ON duties(status, created_at DESC);
 CREATE TABLE IF NOT EXISTS subscriptions (
   id BIGSERIAL PRIMARY KEY,
