@@ -44,6 +44,50 @@ const pool = new Pool({
   ssl:
     process.env.DATABASE_SSL === "true" ? { rejectUnauthorized: true } : false,
 });
+
+// Lazy, additive schema setup for WhatsApp duty metadata. Existing rows are preserved.
+let whatsappDutySchemaPromise = null;
+async function ensureWhatsAppDutySchema() {
+  if (!whatsappDutySchemaPromise) {
+    whatsappDutySchemaPromise = (async () => {
+      const client = await pool.connect();
+      try {
+        await client.query("BEGIN");
+        await client.query("SELECT pg_advisory_xact_lock($1)", [741029317]);
+        await client.query(
+          "ALTER TABLE duties ADD COLUMN IF NOT EXISTS source_type TEXT"
+        );
+        await client.query(
+          "ALTER TABLE duties ADD COLUMN IF NOT EXISTS source_group TEXT"
+        );
+        await client.query(
+          "ALTER TABLE duties ADD COLUMN IF NOT EXISTS source_poster_name TEXT"
+        );
+        await client.query(
+          "ALTER TABLE duties ADD COLUMN IF NOT EXISTS source_poster_phone TEXT"
+        );
+        await client.query(
+          "ALTER TABLE duties ADD COLUMN IF NOT EXISTS source_message_hash TEXT"
+        );
+        await client.query(
+          "CREATE UNIQUE INDEX IF NOT EXISTS duties_source_message_hash_unique ON duties(source_message_hash) WHERE source_message_hash IS NOT NULL"
+        );
+        await client.query("COMMIT");
+      } catch (error) {
+        try {
+          await client.query("ROLLBACK");
+        } catch (_) {}
+        throw error;
+      } finally {
+        client.release();
+      }
+    })().catch((error) => {
+      whatsappDutySchemaPromise = null;
+      throw error;
+    });
+  }
+  return whatsappDutySchemaPromise;
+}
 // Firebase Admin credentials must be stored as a Render secret, never committed to GitHub.
 // Set FIREBASE_SERVICE_ACCOUNT_JSON to the complete service-account JSON string.
 let firebaseMessaging = null;
@@ -865,6 +909,229 @@ app.get("/api/driver-verification", requireAuth, async (req, res, next) => {
 
 // Distance is only accepted from a trusted routing backend in a future integration.
 // The server deliberately labels any manually supplied estimate as approximate.
+// Import a duty parsed from a visible WhatsApp group notification. This is additive;
+// existing manual duty posting endpoints and payloads remain unchanged.
+app.post("/api/duties/import/whatsapp", requireAuth, async (req, res, next) => {
+  try {
+    await ensureWhatsAppDutySchema();
+    const groupName = String(req.body.groupName || "")
+      .trim()
+      .slice(0, 180);
+    const senderName = String(req.body.senderName || "")
+      .trim()
+      .slice(0, 180);
+    const senderPhoneRaw = String(req.body.senderPhone || "").replace(
+      /\D/g,
+      ""
+    );
+    const senderPhone = /^[6-9]\d{9}$/.test(senderPhoneRaw)
+      ? senderPhoneRaw
+      : null;
+    const message = String(req.body.message || "")
+      .trim()
+      .slice(0, 5000);
+    if (!groupName || !message)
+      return res
+        .status(400)
+        .json({ error: "WhatsApp group and message are required" });
+    // Ignore messages that do not look like a duty. Parsing is intentionally conservative.
+    const routeLine = message
+      .split(/\r?\n/)
+      .map((line) => line.trim())
+      .find((line) => /\bto\b|से|→|➜/i.test(line));
+    let routeMatch = null;
+    if (routeLine) {
+      const route = routeLine.match(
+        /^(?:from\s+)?(.+?)\s*(?:to|से|→|➜)\s*(.+?)\s*$/i
+      );
+      if (route)
+        routeMatch = [
+          routeLine,
+          route[1].replace(/[,:-]+$/, "").trim(),
+          route[2].split(/[;,|]/)[0].trim(),
+        ];
+    }
+    if (!routeMatch) {
+      const route = message.match(
+        /([A-Za-z\u0900-\u097F][A-Za-z\u0900-\u097F .'-]{1,45}?)\s*(?:to|से|→|➜)\s*([A-Za-z\u0900-\u097F][A-Za-z\u0900-\u097F .'-]{1,45})/i
+      );
+      if (route) routeMatch = route;
+    }
+    const pickup = routeMatch
+      ? String(routeMatch[1])
+          .trim()
+          .replace(/[.,:]+$/, "")
+          .slice(0, 120)
+      : "";
+    const drop = routeMatch
+      ? String(routeMatch[2])
+          .trim()
+          .replace(/[.,:]+$/, "")
+          .slice(0, 120)
+      : "";
+    const vehiclePatterns = [
+      [/innova\s*crysta/i, "Innova Crysta"],
+      [/innova/i, "Innova"],
+      [/ertiga/i, "Ertiga"],
+      [/swift\s*dzire|dzire/i, "Dzire"],
+      [/sedan/i, "Sedan"],
+      [/hatchback/i, "Hatchback"],
+      [/tempo\s*travell?er|tempo/i, "Tempo Traveller"],
+      [/bus/i, "Bus"],
+      [/suv/i, "SUV"],
+      [/xylo/i, "Xylo"],
+      [/tavera/i, "Tavera"],
+    ];
+    const vehicle = (vehiclePatterns.find(([re]) => re.test(message)) || [
+      null,
+      "",
+    ])[1];
+    if (!pickup || !drop || !vehicle)
+      return res
+        .status(422)
+        .json({
+          ignored: true,
+          reason: "Duty route or vehicle could not be identified",
+        });
+    const lower = message.toLowerCase();
+    const tripType = /round\s*trip|दोनों तरफ|आना जाना/i.test(message)
+      ? "round_trip"
+      : /local|स्थानीय/i.test(message)
+      ? "local_booking"
+      : "one_way";
+    const amountMatch =
+      message.match(/(?:₹|rs\.?\s*|inr\s*)([\d,]{3,})/i) ||
+      message.match(/(?:payment|fare|भाड़ा|किराया)\s*[:=-]?\s*([\d,]{3,})/i);
+    const payout = amountMatch
+      ? Math.round(Number(amountMatch[1].replace(/,/g, "")) * 100)
+      : null;
+    const dateMatch = message.match(
+      /\b(\d{1,2})[\/.-](\d{1,2})[\/.-](\d{2,4})\b/
+    );
+    let dutyDate = null;
+    if (dateMatch) {
+      const day = Number(dateMatch[1]),
+        month = Number(dateMatch[2]),
+        year = Number(
+          dateMatch[3].length === 2 ? "20" + dateMatch[3] : dateMatch[3]
+        );
+      if (
+        year >= 2025 &&
+        year <= 2035 &&
+        month >= 1 &&
+        month <= 12 &&
+        day >= 1 &&
+        day <= 31
+      )
+        dutyDate = `${year}-${String(month).padStart(2, "0")}-${String(
+          day
+        ).padStart(2, "0")}`;
+    }
+    if (!dutyDate) {
+      const monthNames = {
+        jan: 1,
+        january: 1,
+        feb: 2,
+        february: 2,
+        mar: 3,
+        march: 3,
+        apr: 4,
+        april: 4,
+        may: 5,
+        jun: 6,
+        june: 6,
+        jul: 7,
+        july: 7,
+        aug: 8,
+        august: 8,
+        sep: 9,
+        sept: 9,
+        september: 9,
+        oct: 10,
+        october: 10,
+        nov: 11,
+        november: 11,
+        dec: 12,
+        december: 12,
+      };
+      const textDate = message.match(
+        /\b(\d{1,2})(?:st|nd|rd|th)?\s+(jan(?:uary)?|feb(?:ruary)?|mar(?:ch)?|apr(?:il)?|may|jun(?:e)?|jul(?:y)?|aug(?:ust)?|sep(?:t|tember)?|oct(?:ober)?|nov(?:ember)?|dec(?:ember)?)(?:\s+(20\d{2}))?\b/i
+      );
+      if (textDate) {
+        const day = Number(textDate[1]),
+          month = monthNames[textDate[2].toLowerCase()],
+          year = Number(textDate[3] || new Date().getFullYear());
+        if (month && day >= 1 && day <= 31)
+          dutyDate = `${year}-${String(month).padStart(2, "0")}-${String(
+            day
+          ).padStart(2, "0")}`;
+      }
+    }
+    const timeMatch = message.match(/\b(\d{1,2}):(\d{2})\s*(AM|PM)?\b/i);
+    let dutyTime = null;
+    if (timeMatch) {
+      let h = Number(timeMatch[1]),
+        m = Number(timeMatch[2]);
+      const ap = (timeMatch[3] || "").toUpperCase();
+      if (m < 60 && h <= 12) {
+        if (ap === "PM" && h < 12) h += 12;
+        if (ap === "AM" && h === 12) h = 0;
+        dutyTime = `${String(h).padStart(2, "0")}:${String(m).padStart(
+          2,
+          "0"
+        )}:00`;
+      }
+    }
+    const hash = crypto
+      .createHash("sha256")
+      .update(
+        `${groupName.toLowerCase()}|${senderName.toLowerCase()}|${message
+          .toLowerCase()
+          .replace(/\s+/g, " ")
+          .trim()}`
+      )
+      .digest("hex");
+    const inserted = await pool.query(
+      `INSERT INTO duties(user_id,role_posted_as,pickup_city,drop_city,vehicle_type,trip_type,duty_date,duty_time,payout_paise,notes_private,distance_label,source_type,source_group,source_poster_name,source_poster_phone,source_message_hash)
+      VALUES($1,'vendor',$2,$3,$4,$5,$6,$7,$8,$9,'लगभग दूरी','whatsapp',$10,$11,$12,$13)
+      ON CONFLICT (source_message_hash) WHERE source_message_hash IS NOT NULL DO NOTHING RETURNING id,created_at,status`,
+      [
+        req.auth.user_id,
+        pickup,
+        drop,
+        vehicle,
+        tripType,
+        dutyDate,
+        dutyTime,
+        payout,
+        message,
+        groupName,
+        senderName || null,
+        senderPhone,
+        hash,
+      ]
+    );
+    if (!inserted.rowCount)
+      return res.json({ ok: true, duplicate: true, imported: false });
+    broadcastDutyUpdate();
+    const recipients = await pool.query(
+      "SELECT id FROM users WHERE id<>$1 AND (role_mode='driver' OR role_mode='both')",
+      [req.auth.user_id]
+    );
+    void sendPushToUserIds(
+      recipients.rows.map((r) => r.id),
+      "WhatsApp से नई ड्यूटी",
+      `${pickup} से ${drop} के लिए नई ड्यूटी उपलब्ध है।`,
+      { type: "new_duty", dutyId: inserted.rows[0].id }
+    );
+    res
+      .status(201)
+      .json({ ok: true, imported: true, dutyId: inserted.rows[0].id });
+  } catch (e) {
+    next(e);
+  }
+});
+
 app.post("/api/duties", requireAuth, async (req, res, next) => {
   try {
     const pickup = String(req.body.pickupCity || "")
@@ -942,6 +1209,7 @@ app.post("/api/duties", requireAuth, async (req, res, next) => {
 });
 app.get("/api/duties", requireAuth, async (req, res, next) => {
   try {
+    await ensureWhatsAppDutySchema();
     const pickup = String(req.query.pickup || "")
       .trim()
       .slice(0, 120);
@@ -950,8 +1218,8 @@ app.get("/api/duties", requireAuth, async (req, res, next) => {
       .slice(0, 120);
     const r = await pool.query(
       `SELECT d.id,d.user_id,d.role_posted_as,d.pickup_city,d.pickup_address_private,d.drop_city,d.drop_address_private,d.vehicle_type,d.trip_type,
-      d.duty_date,d.duty_time,d.payout_paise,d.notes_private,d.distance_km,d.distance_label,d.created_at,d.status,
-      (d.user_id=$3) AS is_owner, (d.accepted_by_user_id=$3) AS accepted_by_me, u.name AS poster_name, u.phone AS poster_phone
+      d.duty_date,d.duty_time,d.payout_paise,d.notes_private,d.distance_km,d.distance_label,d.created_at,d.status,d.source_type,
+      (d.user_id=$3 AND d.source_type IS DISTINCT FROM 'whatsapp') AS is_owner, (d.accepted_by_user_id=$3) AS accepted_by_me, CASE WHEN d.source_type='whatsapp' THEN d.source_poster_name ELSE u.name END AS poster_name, CASE WHEN d.source_type='whatsapp' THEN d.source_poster_phone ELSE u.phone END AS poster_phone, d.source_group AS source_group, d.source_poster_name AS source_poster_name
       FROM duties d JOIN users u ON u.id=d.user_id WHERE d.status='open' AND ($1='' OR d.pickup_city ILIKE '%'||$1||'%')
       AND ($2='' OR d.drop_city ILIKE '%'||$2||'%') ORDER BY d.created_at DESC LIMIT 100`,
       [pickup, drop, req.auth.user_id]
@@ -967,15 +1235,22 @@ app.get("/api/duties", requireAuth, async (req, res, next) => {
       // Other subscribers see full details immediately; other non-subscribers unlock them after five minutes.
       // Compare IDs as strings too, so the duty poster is never locked by a boolean/type mismatch.
       const isOwner =
-        d.is_owner === true || String(d.user_id) === String(req.auth.user_id);
-      const detailsAvailable = isOwner || active || secondsRemaining === 0;
+        d.is_owner === true ||
+        (String(d.user_id) === String(req.auth.user_id) &&
+          d.source_type !== "whatsapp");
+      const isImporter =
+        d.source_type === "whatsapp" &&
+        String(d.user_id) === String(req.auth.user_id);
+      const detailsAvailable =
+        isOwner || isImporter || active || secondsRemaining === 0;
       const basic = {
         ...privateDuty(d),
         isOwner,
         detailsAvailable,
-        freeWindowSecondsRemaining: isOwner || active ? null : secondsRemaining,
+        freeWindowSecondsRemaining:
+          isOwner || isImporter || active ? null : secondsRemaining,
         membershipRequiredAfterFreeWindow:
-          !isOwner && !active && secondsRemaining === 0,
+          !isOwner && !isImporter && !active && secondsRemaining === 0,
       };
       if (detailsAvailable)
         return {
@@ -1230,10 +1505,11 @@ app.post("/api/duties/:id/booked", requireAuth, async (req, res, next) => {
 });
 app.get("/api/duties/accepted", requireAuth, async (req, res, next) => {
   try {
+    await ensureWhatsAppDutySchema();
     const r = await pool.query(
       `SELECT d.id,d.user_id,d.role_posted_as,d.pickup_city,d.pickup_address_private,d.drop_city,d.drop_address_private,
       d.vehicle_type,d.trip_type,d.duty_date,d.duty_time,d.payout_paise,d.notes_private,d.distance_km,d.distance_label,d.created_at,d.status,
-      (d.user_id=$1) AS is_owner, (d.accepted_by_user_id=$1) AS accepted_by_me, u.name AS poster_name, u.phone AS poster_phone
+      (d.user_id=$1) AS is_owner, (d.accepted_by_user_id=$1) AS accepted_by_me, CASE WHEN d.source_type='whatsapp' THEN d.source_poster_name ELSE u.name END AS poster_name, CASE WHEN d.source_type='whatsapp' THEN d.source_poster_phone ELSE u.phone END AS poster_phone, d.source_group AS source_group, d.source_poster_name AS source_poster_name
       FROM duties d JOIN users u ON u.id=d.user_id WHERE d.accepted_by_user_id=$1 ORDER BY d.created_at DESC LIMIT 100`,
       [req.auth.user_id]
     );
@@ -1242,6 +1518,9 @@ app.get("/api/duties/accepted", requireAuth, async (req, res, next) => {
         ...privateDuty(d),
         posterName: d.poster_name,
         posterPhone: d.poster_phone,
+        sourcePosterName: d.source_poster_name,
+        sourceGroup: d.source_group,
+        sourceType: d.source_type,
         pickupAddress: d.pickup_address_private,
         dropAddress: d.drop_address_private,
         payoutRupees: d.payout_paise == null ? null : d.payout_paise / 100,
@@ -1256,8 +1535,9 @@ app.get("/api/duties/accepted", requireAuth, async (req, res, next) => {
 
 app.get("/api/duties/mine", requireAuth, async (req, res, next) => {
   try {
+    await ensureWhatsAppDutySchema();
     const r = await pool.query(
-      `SELECT id,role_posted_as,pickup_city,pickup_address_private,drop_city,drop_address_private,vehicle_type,trip_type,duty_date,duty_time,payout_paise,notes_private,distance_km,distance_label,created_at,status,
+      `SELECT id,role_posted_as,pickup_city,pickup_address_private,drop_city,drop_address_private,vehicle_type,trip_type,duty_date,duty_time,payout_paise,notes_private,distance_km,distance_label,created_at,status,source_type,source_group,source_poster_name,source_poster_phone,
       (user_id=$1) AS is_owner
       FROM duties WHERE user_id=$1 ORDER BY created_at DESC LIMIT 100`,
       [req.auth.user_id]
@@ -1266,6 +1546,13 @@ app.get("/api/duties/mine", requireAuth, async (req, res, next) => {
       duties: r.rows.map((d) => ({
         ...privateDuty(d),
         rolePostedAs: d.role_posted_as,
+        posterName:
+          d.source_type === "whatsapp" ? d.source_poster_name : req.auth.name,
+        posterPhone:
+          d.source_type === "whatsapp" ? d.source_poster_phone : req.auth.phone,
+        sourcePosterName: d.source_poster_name,
+        sourceGroup: d.source_group,
+        sourceType: d.source_type,
         pickupAddress: d.pickup_address_private,
         dropAddress: d.drop_address_private,
         payoutRupees: d.payout_paise == null ? null : d.payout_paise / 100,
