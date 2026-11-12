@@ -354,6 +354,21 @@ async function resolveWhatsAppVendorUser() {
 
 app.post("/api/admin/whatsapp-duties", requireAdmin, async (req, res, next) => {
   try {
+    await pool.query(`
+      CREATE TABLE IF NOT EXISTS whatsapp_duty_imports (
+        id BIGSERIAL PRIMARY KEY,
+        group_name TEXT NOT NULL,
+        sender_name TEXT NOT NULL DEFAULT '',
+        sender_phone TEXT NOT NULL DEFAULT '',
+        message_text TEXT NOT NULL,
+        message_hash TEXT NOT NULL UNIQUE,
+        status TEXT NOT NULL DEFAULT 'pending' CHECK (status IN ('pending','published','ignored')),
+        created_at TIMESTAMPTZ NOT NULL DEFAULT now(),
+        reviewed_at TIMESTAMPTZ,
+        reviewed_by TEXT,
+        published_duty_id BIGINT REFERENCES duties(id) ON DELETE SET NULL
+      )
+    `);
     const groupName = String(req.body.groupName || "")
       .trim()
       .slice(0, 200);
@@ -392,6 +407,25 @@ app.post("/api/admin/whatsapp-duties", requireAdmin, async (req, res, next) => {
 
 app.get("/api/admin/whatsapp-duties", requireAdmin, async (req, res, next) => {
   try {
+    // Self-heal the inbox table on first import request; safe to run repeatedly.
+    await pool.query(`
+      CREATE TABLE IF NOT EXISTS whatsapp_duty_imports (
+        id BIGSERIAL PRIMARY KEY,
+        group_name TEXT NOT NULL,
+        sender_name TEXT NOT NULL DEFAULT '',
+        sender_phone TEXT NOT NULL DEFAULT '',
+        message_text TEXT NOT NULL,
+        message_hash TEXT NOT NULL UNIQUE,
+        status TEXT NOT NULL DEFAULT 'pending' CHECK (status IN ('pending','published','ignored')),
+        created_at TIMESTAMPTZ NOT NULL DEFAULT now(),
+        reviewed_at TIMESTAMPTZ,
+        reviewed_by TEXT,
+        published_duty_id BIGINT REFERENCES duties(id) ON DELETE SET NULL
+      )
+    `);
+    await pool.query(
+      `CREATE INDEX IF NOT EXISTS whatsapp_duty_imports_status_created ON whatsapp_duty_imports(status, created_at DESC)`
+    );
     const status = ["pending", "published", "ignored"].includes(
       String(req.query.status || "pending")
     )
