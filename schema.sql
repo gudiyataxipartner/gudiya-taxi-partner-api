@@ -46,6 +46,22 @@ CREATE TABLE IF NOT EXISTS duties (
 );
 CREATE UNIQUE INDEX IF NOT EXISTS duties_source_message_hash_unique ON duties(source_message_hash) WHERE source_message_hash IS NOT NULL;
 CREATE INDEX IF NOT EXISTS duties_open_created ON duties(status, created_at DESC);
+CREATE TABLE IF NOT EXISTS whatsapp_duty_imports (
+  id BIGSERIAL PRIMARY KEY,
+  group_name TEXT NOT NULL,
+  sender_name TEXT NOT NULL DEFAULT '',
+  sender_phone TEXT NOT NULL DEFAULT '',
+  message_text TEXT NOT NULL,
+  message_hash TEXT NOT NULL UNIQUE,
+  status TEXT NOT NULL DEFAULT 'pending' CHECK (status IN ('pending','published','ignored')),
+  created_at TIMESTAMPTZ NOT NULL DEFAULT now(),
+  reviewed_at TIMESTAMPTZ,
+  reviewed_by TEXT,
+  published_duty_id BIGINT REFERENCES duties(id) ON DELETE SET NULL
+);
+CREATE INDEX IF NOT EXISTS whatsapp_duty_imports_status_created
+  ON whatsapp_duty_imports(status, created_at DESC);
+
 CREATE TABLE IF NOT EXISTS subscriptions (
   id BIGSERIAL PRIMARY KEY,
   user_id BIGINT NOT NULL REFERENCES users(id) ON DELETE CASCADE,
