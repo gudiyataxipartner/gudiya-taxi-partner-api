@@ -318,6 +318,205 @@ function requireAdmin(req, res, next) {
   }
   next();
 }
+
+// WhatsApp group-duty inbox: Admin reviews notifications before publishing.
+// Published duties are created under the configured Vendor account, never the Admin token.
+async function resolveWhatsAppVendorUser() {
+  const configuredPhone = String(
+    process.env.WHATSAPP_VENDOR_PHONE || ""
+  ).replace(/\D/g, "");
+  if (configuredPhone) {
+    const found = await pool.query(
+      "SELECT id, phone, name FROM users WHERE phone=$1 AND role_mode IN ('vendor','both') LIMIT 1",
+      [configuredPhone]
+    );
+    if (!found.rowCount) {
+      throw Object.assign(
+        new Error(
+          "WHATSAPP_VENDOR_PHONE से जुड़ा Vendor account नहीं मिला। Render Environment में सही 10-digit Vendor मोबाइल नंबर सेट करें।"
+        ),
+        { status: 400 }
+      );
+    }
+    return found.rows[0];
+  }
+  const candidates = await pool.query(
+    "SELECT id, phone, name FROM users WHERE role_mode IN ('vendor','both') ORDER BY updated_at DESC NULLS LAST, id DESC LIMIT 2"
+  );
+  if (candidates.rowCount === 1) return candidates.rows[0];
+  throw Object.assign(
+    new Error(
+      "WhatsApp Duty किस Vendor account में पोस्ट करनी है यह तय नहीं है। Render Environment में WHATSAPP_VENDOR_PHONE सेट करें।"
+    ),
+    { status: 400 }
+  );
+}
+
+app.post("/api/admin/whatsapp-duties", requireAdmin, async (req, res, next) => {
+  try {
+    const groupName = String(req.body.groupName || "")
+      .trim()
+      .slice(0, 200);
+    const senderName = String(req.body.senderName || "")
+      .trim()
+      .slice(0, 200);
+    const senderPhone = String(req.body.senderPhone || "")
+      .replace(/\D/g, "")
+      .slice(-10);
+    const messageText = String(req.body.message || "")
+      .trim()
+      .slice(0, 10000);
+    if (!groupName || !messageText)
+      return res
+        .status(400)
+        .json({ error: "WhatsApp Group और message जरूरी हैं।" });
+    const messageHash = crypto
+      .createHash("sha256")
+      .update(groupName + "\n" + messageText)
+      .digest("hex");
+    const inserted = await pool.query(
+      `INSERT INTO whatsapp_duty_imports(group_name,sender_name,sender_phone,message_text,message_hash,status)
+       VALUES($1,$2,$3,$4,$5,'pending')
+       ON CONFLICT(message_hash) DO NOTHING
+       RETURNING id,group_name,sender_name,sender_phone,message_text,created_at,status`,
+      [groupName, senderName, senderPhone, messageText, messageHash]
+    );
+    if (!inserted.rowCount) return res.json({ ok: true, duplicate: true });
+    res
+      .status(201)
+      .json({ ok: true, duplicate: false, duty: inserted.rows[0] });
+  } catch (e) {
+    next(e);
+  }
+});
+
+app.get("/api/admin/whatsapp-duties", requireAdmin, async (req, res, next) => {
+  try {
+    const status = ["pending", "published", "ignored"].includes(
+      String(req.query.status || "pending")
+    )
+      ? String(req.query.status || "pending")
+      : "pending";
+    const result = await pool.query(
+      `SELECT id,group_name,sender_name,sender_phone,message_text,status,created_at,published_duty_id
+         FROM whatsapp_duty_imports WHERE status=$1 ORDER BY created_at DESC LIMIT 200`,
+      [status]
+    );
+    res.json({ duties: result.rows });
+  } catch (e) {
+    next(e);
+  }
+});
+
+app.post(
+  "/api/admin/whatsapp-duties/:id/ignore",
+  requireAdmin,
+  async (req, res, next) => {
+    try {
+      const result = await pool.query(
+        `UPDATE whatsapp_duty_imports SET status='ignored', reviewed_at=now(), reviewed_by=$2
+        WHERE id=$1 AND status='pending' RETURNING id,status`,
+        [req.params.id, req.admin?.username || "admin"]
+      );
+      if (!result.rowCount)
+        return res
+          .status(404)
+          .json({ error: "Pending WhatsApp message नहीं मिला।" });
+      res.json({ ok: true, duty: result.rows[0] });
+    } catch (e) {
+      next(e);
+    }
+  }
+);
+
+app.post(
+  "/api/admin/whatsapp-duties/:id/publish",
+  requireAdmin,
+  async (req, res, next) => {
+    const client = await pool.connect();
+    try {
+      const pickup = String(req.body.pickupCity || "")
+        .trim()
+        .slice(0, 120);
+      const drop = String(req.body.dropCity || "")
+        .trim()
+        .slice(0, 120);
+      const vehicle = String(req.body.vehicleType || "")
+        .trim()
+        .slice(0, 80);
+      const tripType = String(req.body.tripType || "one_way");
+      if (!pickup || !drop || !vehicle)
+        return res
+          .status(400)
+          .json({ error: "Pickup City, Drop City और Vehicle जरूरी हैं।" });
+      if (!["one_way", "round_trip", "local_booking"].includes(tripType))
+        return res.status(400).json({ error: "Trip Type सही नहीं है।" });
+      const payout =
+        req.body.payoutRupees == null || req.body.payoutRupees === ""
+          ? null
+          : Math.round(Number(req.body.payoutRupees) * 100);
+      if (
+        payout != null &&
+        (!Number.isFinite(payout) || payout < 0 || payout > 100000000)
+      )
+        return res.status(400).json({ error: "Driver Payment सही नहीं है।" });
+      const vendor = await resolveWhatsAppVendorUser();
+      await client.query("BEGIN");
+      const pending = await client.query(
+        "SELECT * FROM whatsapp_duty_imports WHERE id=$1 AND status='pending' FOR UPDATE",
+        [req.params.id]
+      );
+      if (!pending.rowCount) {
+        await client.query("ROLLBACK");
+        return res
+          .status(404)
+          .json({
+            error:
+              "Pending WhatsApp message नहीं मिला या पहले ही process हो चुका है।",
+          });
+      }
+      const source = pending.rows[0];
+      const duty = await client.query(
+        `INSERT INTO duties(user_id,role_posted_as,pickup_city,drop_city,vehicle_type,trip_type,duty_date,duty_time,payout_paise,notes_private,source_type,source_group,source_poster_name,source_poster_phone,source_message_hash)
+       VALUES($1,'vendor',$2,$3,$4,$5,$6,$7,$8,$9,'whatsapp_group',$10,$11,$12,$13)
+       RETURNING id,pickup_city,drop_city,vehicle_type,trip_type,duty_date,duty_time,status`,
+        [
+          vendor.id,
+          pickup,
+          drop,
+          vehicle,
+          tripType,
+          req.body.dutyDate || null,
+          req.body.dutyTime || null,
+          payout,
+          source.message_text,
+          source.group_name,
+          source.sender_name,
+          source.sender_phone,
+          source.message_hash,
+        ]
+      );
+      await client.query(
+        `UPDATE whatsapp_duty_imports SET status='published', reviewed_at=now(), reviewed_by=$2, published_duty_id=$3 WHERE id=$1`,
+        [source.id, req.admin?.username || "admin", duty.rows[0].id]
+      );
+      await client.query("COMMIT");
+      broadcastDutyUpdate();
+      res.json({
+        ok: true,
+        dutyId: duty.rows[0].id,
+        vendor: { name: vendor.name, phone: vendor.phone },
+        duty: duty.rows[0],
+      });
+    } catch (e) {
+      await client.query("ROLLBACK").catch(() => {});
+      next(e);
+    } finally {
+      client.release();
+    }
+  }
+);
+
 async function hasActiveMembership(userId) {
   // One authoritative membership decision for both membership UI and duty details.
   // An explicit Admin override wins over payment/subscription records.
