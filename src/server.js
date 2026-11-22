@@ -1213,6 +1213,20 @@ app.get("/api/duties", requireAuth, async (req, res, next) => {
     const drop = String(req.query.drop || "")
       .trim()
       .slice(0, 120);
+    // Apply filters before LIMIT so matching duties are not hidden by unrelated recent rows.
+    const dutyDate = /^\d{4}-\d{2}-\d{2}$/.test(String(req.query.date || "")) ? String(req.query.date) : "";
+    const vehicleCategory = String(req.query.vehicle || "").trim().toLowerCase();
+    const vehiclePatterns = {
+      sedan: "(sedan|सेडान|dzire|swift)",
+      hatchback: "(hatchback|हैचबैक)",
+      suv: "(suv|एसयूवी|xylo|tavera|ertiga)",
+      innova: "(innova|इनोवा)",
+      tempo: "(tempo|traveller|टेम्पो)",
+      ertiga: "(ertiga|अर्टिगा)",
+      dzire: "(dzire|swift|डिजायर)",
+      other: "^(अन्य|other)$",
+    };
+    const vehiclePattern = vehiclePatterns[vehicleCategory] || "";
     const r = await pool.query(
       `SELECT d.id,d.user_id,d.role_posted_as,d.pickup_city,d.pickup_address_private,d.drop_city,d.drop_address_private,d.vehicle_type,d.trip_type,
       d.duty_date,d.duty_time,d.payout_paise,d.notes_private,d.distance_km,d.distance_label,d.created_at,
@@ -1221,8 +1235,11 @@ app.get("/api/duties", requireAuth, async (req, res, next) => {
       d.status,d.source_type,
       (d.user_id=$3 AND d.source_type IS DISTINCT FROM 'whatsapp') AS is_owner, (d.accepted_by_user_id=$3) AS accepted_by_me, CASE WHEN d.source_type='whatsapp' THEN d.source_poster_name ELSE u.name END AS poster_name, CASE WHEN d.source_type='whatsapp' THEN d.source_poster_phone ELSE u.phone END AS poster_phone, d.source_group AS source_group, d.source_poster_name AS source_poster_name, d.is_featured, u.driver_verification, u.vendor_verification
       FROM duties d JOIN users u ON u.id=d.user_id WHERE d.status='open' AND ($1='' OR d.pickup_city ILIKE '%'||$1||'%')
-      AND ($2='' OR d.drop_city ILIKE '%'||$2||'%') ORDER BY d.is_featured DESC, d.created_at DESC LIMIT 100`,
-      [pickup, drop, req.auth.user_id]
+      AND ($2='' OR d.drop_city ILIKE '%'||$2||'%')
+      AND ($4='' OR d.duty_date::text=$4)
+      AND ($5='' OR d.vehicle_type ~* $5)
+      ORDER BY d.is_featured DESC, d.created_at DESC LIMIT 100`,
+      [pickup, drop, req.auth.user_id, dutyDate, vehiclePattern]
     );
     const active = await hasActiveMembership(req.auth.user_id);
     const duties = r.rows.map((d) => {
