@@ -44,6 +44,31 @@ const pool = new Pool({
   ssl:
     process.env.DATABASE_SSL === "true" ? { rejectUnauthorized: true } : false,
 });
+
+// Lazy, additive schema setup for WhatsApp duty metadata. Existing rows are preserved.
+let whatsappDutySchemaPromise = null;
+async function ensureWhatsAppDutySchema() {
+  if (!whatsappDutySchemaPromise) {
+    whatsappDutySchemaPromise = (async () => {
+      const client = await pool.connect();
+      try {
+        await client.query("BEGIN");
+        await client.query("SELECT pg_advisory_xact_lock($1)", [741029317]);
+        await client.query("ALTER TABLE duties ADD COLUMN IF NOT EXISTS source_type TEXT");
+        await client.query("ALTER TABLE duties ADD COLUMN IF NOT EXISTS source_group TEXT");
+        await client.query("ALTER TABLE duties ADD COLUMN IF NOT EXISTS source_poster_name TEXT");
+        await client.query("ALTER TABLE duties ADD COLUMN IF NOT EXISTS source_poster_phone TEXT");
+        await client.query("ALTER TABLE duties ADD COLUMN IF NOT EXISTS source_message_hash TEXT");
+        await client.query("CREATE UNIQUE INDEX IF NOT EXISTS duties_source_message_hash_unique ON duties(source_message_hash) WHERE source_message_hash IS NOT NULL");
+        await client.query("COMMIT");
+      } catch (error) {
+        try { await client.query("ROLLBACK"); } catch (_) {}
+        throw error;
+      } finally { client.release(); }
+    })().catch((error) => { whatsappDutySchemaPromise = null; throw error; });
+  }
+  return whatsappDutySchemaPromise;
+}
 // Firebase Admin credentials must be stored as a Render secret, never committed to GitHub.
 // Set FIREBASE_SERVICE_ACCOUNT_JSON to the complete service-account JSON string.
 let firebaseMessaging = null;
@@ -318,239 +343,6 @@ function requireAdmin(req, res, next) {
   }
   next();
 }
-
-// WhatsApp group-duty inbox: Admin reviews notifications before publishing.
-// Published duties are created under the configured Vendor account, never the Admin token.
-async function resolveWhatsAppVendorUser() {
-  const configuredPhone = String(
-    process.env.WHATSAPP_VENDOR_PHONE || ""
-  ).replace(/\D/g, "");
-  if (configuredPhone) {
-    const found = await pool.query(
-      "SELECT id, phone, name FROM users WHERE phone=$1 AND role_mode IN ('vendor','both') LIMIT 1",
-      [configuredPhone]
-    );
-    if (!found.rowCount) {
-      throw Object.assign(
-        new Error(
-          "WHATSAPP_VENDOR_PHONE से जुड़ा Vendor account नहीं मिला। Render Environment में सही 10-digit Vendor मोबाइल नंबर सेट करें।"
-        ),
-        { status: 400 }
-      );
-    }
-    return found.rows[0];
-  }
-  const candidates = await pool.query(
-    "SELECT id, phone, name FROM users WHERE role_mode IN ('vendor','both') ORDER BY updated_at DESC NULLS LAST, id DESC LIMIT 2"
-  );
-  if (candidates.rowCount === 1) return candidates.rows[0];
-  throw Object.assign(
-    new Error(
-      "WhatsApp Duty किस Vendor account में पोस्ट करनी है यह तय नहीं है। Render Environment में WHATSAPP_VENDOR_PHONE सेट करें।"
-    ),
-    { status: 400 }
-  );
-}
-
-app.post("/api/admin/whatsapp-duties", requireAdmin, async (req, res, next) => {
-  try {
-    await pool.query(`
-      CREATE TABLE IF NOT EXISTS whatsapp_duty_imports (
-        id BIGSERIAL PRIMARY KEY,
-        group_name TEXT NOT NULL,
-        sender_name TEXT NOT NULL DEFAULT '',
-        sender_phone TEXT NOT NULL DEFAULT '',
-        message_text TEXT NOT NULL,
-        message_hash TEXT NOT NULL UNIQUE,
-        status TEXT NOT NULL DEFAULT 'pending' CHECK (status IN ('pending','published','ignored')),
-        created_at TIMESTAMPTZ NOT NULL DEFAULT now(),
-        reviewed_at TIMESTAMPTZ,
-        reviewed_by TEXT,
-        published_duty_id BIGINT REFERENCES duties(id) ON DELETE SET NULL
-      )
-    `);
-    const groupName = String(req.body.groupName || "")
-      .trim()
-      .slice(0, 200);
-    const senderName = String(req.body.senderName || "")
-      .trim()
-      .slice(0, 200);
-    const senderPhone = String(req.body.senderPhone || "")
-      .replace(/\D/g, "")
-      .slice(-10);
-    const messageText = String(req.body.message || "")
-      .trim()
-      .slice(0, 10000);
-    if (!groupName || !messageText)
-      return res
-        .status(400)
-        .json({ error: "WhatsApp Group और message जरूरी हैं।" });
-    const messageHash = crypto
-      .createHash("sha256")
-      .update(groupName + "\n" + messageText)
-      .digest("hex");
-    const inserted = await pool.query(
-      `INSERT INTO whatsapp_duty_imports(group_name,sender_name,sender_phone,message_text,message_hash,status)
-       VALUES($1,$2,$3,$4,$5,'pending')
-       ON CONFLICT(message_hash) DO NOTHING
-       RETURNING id,group_name,sender_name,sender_phone,message_text,created_at,status`,
-      [groupName, senderName, senderPhone, messageText, messageHash]
-    );
-    if (!inserted.rowCount) return res.json({ ok: true, duplicate: true });
-    res
-      .status(201)
-      .json({ ok: true, duplicate: false, duty: inserted.rows[0] });
-  } catch (e) {
-    next(e);
-  }
-});
-
-app.get("/api/admin/whatsapp-duties", requireAdmin, async (req, res, next) => {
-  try {
-    // Self-heal the inbox table on first import request; safe to run repeatedly.
-    await pool.query(`
-      CREATE TABLE IF NOT EXISTS whatsapp_duty_imports (
-        id BIGSERIAL PRIMARY KEY,
-        group_name TEXT NOT NULL,
-        sender_name TEXT NOT NULL DEFAULT '',
-        sender_phone TEXT NOT NULL DEFAULT '',
-        message_text TEXT NOT NULL,
-        message_hash TEXT NOT NULL UNIQUE,
-        status TEXT NOT NULL DEFAULT 'pending' CHECK (status IN ('pending','published','ignored')),
-        created_at TIMESTAMPTZ NOT NULL DEFAULT now(),
-        reviewed_at TIMESTAMPTZ,
-        reviewed_by TEXT,
-        published_duty_id BIGINT REFERENCES duties(id) ON DELETE SET NULL
-      )
-    `);
-    await pool.query(
-      `CREATE INDEX IF NOT EXISTS whatsapp_duty_imports_status_created ON whatsapp_duty_imports(status, created_at DESC)`
-    );
-    const status = ["pending", "published", "ignored"].includes(
-      String(req.query.status || "pending")
-    )
-      ? String(req.query.status || "pending")
-      : "pending";
-    const result = await pool.query(
-      `SELECT id,group_name,sender_name,sender_phone,message_text,status,created_at,published_duty_id
-         FROM whatsapp_duty_imports WHERE status=$1 ORDER BY created_at DESC LIMIT 200`,
-      [status]
-    );
-    res.json({ duties: result.rows });
-  } catch (e) {
-    next(e);
-  }
-});
-
-app.post(
-  "/api/admin/whatsapp-duties/:id/ignore",
-  requireAdmin,
-  async (req, res, next) => {
-    try {
-      const result = await pool.query(
-        `UPDATE whatsapp_duty_imports SET status='ignored', reviewed_at=now(), reviewed_by=$2
-        WHERE id=$1 AND status='pending' RETURNING id,status`,
-        [req.params.id, req.admin?.username || "admin"]
-      );
-      if (!result.rowCount)
-        return res
-          .status(404)
-          .json({ error: "Pending WhatsApp message नहीं मिला।" });
-      res.json({ ok: true, duty: result.rows[0] });
-    } catch (e) {
-      next(e);
-    }
-  }
-);
-
-app.post(
-  "/api/admin/whatsapp-duties/:id/publish",
-  requireAdmin,
-  async (req, res, next) => {
-    const client = await pool.connect();
-    try {
-      const pickup = String(req.body.pickupCity || "")
-        .trim()
-        .slice(0, 120);
-      const drop = String(req.body.dropCity || "")
-        .trim()
-        .slice(0, 120);
-      const vehicle = String(req.body.vehicleType || "")
-        .trim()
-        .slice(0, 80);
-      const tripType = String(req.body.tripType || "one_way");
-      if (!pickup || !drop || !vehicle)
-        return res
-          .status(400)
-          .json({ error: "Pickup City, Drop City और Vehicle जरूरी हैं।" });
-      if (!["one_way", "round_trip", "local_booking"].includes(tripType))
-        return res.status(400).json({ error: "Trip Type सही नहीं है।" });
-      const payout =
-        req.body.payoutRupees == null || req.body.payoutRupees === ""
-          ? null
-          : Math.round(Number(req.body.payoutRupees) * 100);
-      if (
-        payout != null &&
-        (!Number.isFinite(payout) || payout < 0 || payout > 100000000)
-      )
-        return res.status(400).json({ error: "Driver Payment सही नहीं है।" });
-      const vendor = await resolveWhatsAppVendorUser();
-      await client.query("BEGIN");
-      const pending = await client.query(
-        "SELECT * FROM whatsapp_duty_imports WHERE id=$1 AND status='pending' FOR UPDATE",
-        [req.params.id]
-      );
-      if (!pending.rowCount) {
-        await client.query("ROLLBACK");
-        return res
-          .status(404)
-          .json({
-            error:
-              "Pending WhatsApp message नहीं मिला या पहले ही process हो चुका है।",
-          });
-      }
-      const source = pending.rows[0];
-      const duty = await client.query(
-        `INSERT INTO duties(user_id,role_posted_as,pickup_city,drop_city,vehicle_type,trip_type,duty_date,duty_time,payout_paise,notes_private,source_type,source_group,source_poster_name,source_poster_phone,source_message_hash)
-       VALUES($1,'vendor',$2,$3,$4,$5,$6,$7,$8,$9,'whatsapp_group',$10,$11,$12,$13)
-       RETURNING id,pickup_city,drop_city,vehicle_type,trip_type,duty_date,duty_time,status`,
-        [
-          vendor.id,
-          pickup,
-          drop,
-          vehicle,
-          tripType,
-          req.body.dutyDate || null,
-          req.body.dutyTime || null,
-          payout,
-          source.message_text,
-          source.group_name,
-          source.sender_name,
-          source.sender_phone,
-          source.message_hash,
-        ]
-      );
-      await client.query(
-        `UPDATE whatsapp_duty_imports SET status='published', reviewed_at=now(), reviewed_by=$2, published_duty_id=$3 WHERE id=$1`,
-        [source.id, req.admin?.username || "admin", duty.rows[0].id]
-      );
-      await client.query("COMMIT");
-      broadcastDutyUpdate();
-      res.json({
-        ok: true,
-        dutyId: duty.rows[0].id,
-        vendor: { name: vendor.name, phone: vendor.phone },
-        duty: duty.rows[0],
-      });
-    } catch (e) {
-      await client.query("ROLLBACK").catch(() => {});
-      next(e);
-    } finally {
-      client.release();
-    }
-  }
-);
-
 async function hasActiveMembership(userId) {
   // One authoritative membership decision for both membership UI and duty details.
   // An explicit Admin override wins over payment/subscription records.
@@ -563,9 +355,7 @@ async function hasActiveMembership(userId) {
     [userId]
   );
   if (override.rowCount) {
-    const status = String(override.rows[0].status || "")
-      .trim()
-      .toLowerCase();
+    const status = String(override.rows[0].status || "").trim().toLowerCase();
     return status === "paid" || status === "active";
   }
 
@@ -1121,6 +911,65 @@ app.get("/api/driver-verification", requireAuth, async (req, res, next) => {
 
 // Distance is only accepted from a trusted routing backend in a future integration.
 // The server deliberately labels any manually supplied estimate as approximate.
+// Import a duty parsed from a visible WhatsApp group notification. This is additive;
+// existing manual duty posting endpoints and payloads remain unchanged.
+app.post("/api/duties/import/whatsapp", requireAuth, async (req, res, next) => {
+  try {
+    await ensureWhatsAppDutySchema();
+    const groupName = String(req.body.groupName || "").trim().slice(0, 180);
+    const senderName = String(req.body.senderName || "").trim().slice(0, 180);
+    const senderPhoneRaw = String(req.body.senderPhone || "").replace(/\D/g, "");
+    const senderPhone = /^[6-9]\d{9}$/.test(senderPhoneRaw) ? senderPhoneRaw : null;
+    const message = String(req.body.message || "").trim().slice(0, 5000);
+    if (!groupName || !message) return res.status(400).json({ error: "WhatsApp group and message are required" });
+    // Ignore messages that do not look like a duty. Parsing is intentionally conservative.
+    const routeLine = message.split(/\r?\n/).map(line => line.trim()).find(line => /\bto\b|से|→|➜/i.test(line));
+    let routeMatch = null;
+    if (routeLine) {
+      const route = routeLine.match(/^(?:from\s+)?(.+?)\s*(?:to|से|→|➜)\s*(.+?)\s*$/i);
+      if (route) routeMatch = [routeLine, route[1].replace(/[,:-]+$/, "").trim(), route[2].split(/[;,|]/)[0].trim()];
+    }
+    if (!routeMatch) {
+      const route = message.match(/([A-Za-z\u0900-\u097F][A-Za-z\u0900-\u097F .'-]{1,45}?)\s*(?:to|से|→|➜)\s*([A-Za-z\u0900-\u097F][A-Za-z\u0900-\u097F .'-]{1,45})/i);
+      if (route) routeMatch = route;
+    }
+    const pickup = routeMatch ? String(routeMatch[1]).trim().replace(/[.,:]+$/, "").slice(0,120) : "";
+    const drop = routeMatch ? String(routeMatch[2]).trim().replace(/[.,:]+$/, "").slice(0,120) : "";
+    const vehiclePatterns = [
+      [/innova\s*crysta/i,"Innova Crysta"],[/innova/i,"Innova"],[/ertiga/i,"Ertiga"],
+      [/swift\s*dzire|dzire/i,"Dzire"],[/sedan/i,"Sedan"],[/hatchback/i,"Hatchback"],
+      [/tempo\s*travell?er|tempo/i,"Tempo Traveller"],[/bus/i,"Bus"],[/suv/i,"SUV"],[/xylo/i,"Xylo"],[/tavera/i,"Tavera"]
+    ];
+    const vehicle = (vehiclePatterns.find(([re]) => re.test(message)) || [null, ""])[1];
+    if (!pickup || !drop || !vehicle) return res.status(422).json({ ignored: true, reason: "Duty route or vehicle could not be identified" });
+    const lower = message.toLowerCase();
+    const tripType = /round\s*trip|दोनों तरफ|आना जाना/i.test(message) ? "round_trip" : /local|स्थानीय/i.test(message) ? "local_booking" : "one_way";
+    const amountMatch = message.match(/(?:₹|rs\.?\s*|inr\s*)([\d,]{3,})/i) || message.match(/(?:payment|fare|भाड़ा|किराया)\s*[:=-]?\s*([\d,]{3,})/i);
+    const payout = amountMatch ? Math.round(Number(amountMatch[1].replace(/,/g,"")) * 100) : null;
+    const dateMatch = message.match(/\b(\d{1,2})[\/.-](\d{1,2})[\/.-](\d{2,4})\b/);
+    let dutyDate = null;
+    if (dateMatch) { const day=Number(dateMatch[1]), month=Number(dateMatch[2]), year=Number(dateMatch[3].length===2?"20"+dateMatch[3]:dateMatch[3]); if(year>=2025&&year<=2035&&month>=1&&month<=12&&day>=1&&day<=31) dutyDate=`${year}-${String(month).padStart(2,"0")}-${String(day).padStart(2,"0")}`; }
+    if (!dutyDate) {
+      const monthNames = {jan:1,january:1,feb:2,february:2,mar:3,march:3,apr:4,april:4,may:5,jun:6,june:6,jul:7,july:7,aug:8,august:8,sep:9,sept:9,september:9,oct:10,october:10,nov:11,november:11,dec:12,december:12};
+      const textDate = message.match(/\b(\d{1,2})(?:st|nd|rd|th)?\s+(jan(?:uary)?|feb(?:ruary)?|mar(?:ch)?|apr(?:il)?|may|jun(?:e)?|jul(?:y)?|aug(?:ust)?|sep(?:t|tember)?|oct(?:ober)?|nov(?:ember)?|dec(?:ember)?)(?:\s+(20\d{2}))?\b/i);
+      if (textDate) { const day=Number(textDate[1]), month=monthNames[textDate[2].toLowerCase()], year=Number(textDate[3] || new Date().getFullYear()); if(month&&day>=1&&day<=31)dutyDate=`${year}-${String(month).padStart(2,"0")}-${String(day).padStart(2,"0")}`; }
+    }
+    const timeMatch = message.match(/\b(\d{1,2}):(\d{2})\s*(AM|PM)?\b/i);
+    let dutyTime = null;
+    if(timeMatch){let h=Number(timeMatch[1]),m=Number(timeMatch[2]);const ap=(timeMatch[3]||"").toUpperCase();if(m<60&&h<=12){if(ap==="PM"&&h<12)h+=12;if(ap==="AM"&&h===12)h=0;dutyTime=`${String(h).padStart(2,"0")}:${String(m).padStart(2,"0")}:00`;}}
+    const hash = crypto.createHash("sha256").update(`${groupName.toLowerCase()}|${senderName.toLowerCase()}|${message.toLowerCase().replace(/\s+/g," ").trim()}`).digest("hex");
+    const inserted = await pool.query(`INSERT INTO duties(user_id,role_posted_as,pickup_city,drop_city,vehicle_type,trip_type,duty_date,duty_time,payout_paise,notes_private,distance_label,source_type,source_group,source_poster_name,source_poster_phone,source_message_hash)
+      VALUES($1,'vendor',$2,$3,$4,$5,$6,$7,$8,$9,'लगभग दूरी','whatsapp',$10,$11,$12,$13)
+      ON CONFLICT (source_message_hash) WHERE source_message_hash IS NOT NULL DO NOTHING RETURNING id,created_at,status`,
+      [req.auth.user_id,pickup,drop,vehicle,tripType,dutyDate,dutyTime,payout,message,groupName,senderName||null,senderPhone,hash]);
+    if (!inserted.rowCount) return res.json({ ok:true, duplicate:true, imported:false });
+    broadcastDutyUpdate();
+    const recipients = await pool.query("SELECT id FROM users WHERE id<>$1 AND (role_mode='driver' OR role_mode='both')", [req.auth.user_id]);
+    void sendPushToUserIds(recipients.rows.map(r=>r.id), "WhatsApp से नई ड्यूटी", `${pickup} से ${drop} के लिए नई ड्यूटी उपलब्ध है।`, { type:"new_duty", dutyId:inserted.rows[0].id });
+    res.status(201).json({ ok:true, imported:true, dutyId:inserted.rows[0].id });
+  } catch (e) { next(e); }
+});
+
 app.post("/api/duties", requireAuth, async (req, res, next) => {
   try {
     const pickup = String(req.body.pickupCity || "")
@@ -1196,8 +1045,21 @@ app.post("/api/duties", requireAuth, async (req, res, next) => {
     next(e);
   }
 });
+// Additive user features: route alerts, saved duties and duty reporting.
+app.get("/api/preferences/route-alerts", requireAuth, async (req, res, next) => {
+  try { const r=await pool.query("SELECT pickup_city,drop_city,enabled FROM user_route_alert_preferences WHERE user_id=$1",[req.auth.user_id]); res.json({preference:r.rows[0]||{pickup_city:"",drop_city:"",enabled:false}}); } catch(e){next(e);}
+});
+app.put("/api/preferences/route-alerts", requireAuth, async (req,res,next)=>{
+  try { const pickup=String(req.body.pickupCity||"").trim().slice(0,120), drop=String(req.body.dropCity||"").trim().slice(0,120), enabled=req.body.enabled!==false; if(enabled&&!pickup&&!drop)return res.status(400).json({error:"कम से कम एक शहर या रूट भरें।"}); const r=await pool.query(`INSERT INTO user_route_alert_preferences(user_id,pickup_city,drop_city,enabled,updated_at) VALUES($1,$2,$3,$4,now()) ON CONFLICT(user_id) DO UPDATE SET pickup_city=EXCLUDED.pickup_city,drop_city=EXCLUDED.drop_city,enabled=EXCLUDED.enabled,updated_at=now() RETURNING pickup_city,drop_city,enabled`,[req.auth.user_id,pickup,drop,enabled]); res.json({preference:r.rows[0]}); } catch(e){next(e);}
+});
+app.get("/api/duties/favorites", requireAuth, async(req,res,next)=>{try{const r=await pool.query(`SELECT d.id,d.pickup_city,d.drop_city,d.vehicle_type,d.trip_type,d.duty_date,d.duty_time,d.status,d.created_at,d.is_featured FROM user_favorite_duties f JOIN duties d ON d.id=f.duty_id WHERE f.user_id=$1 ORDER BY f.created_at DESC LIMIT 200`,[req.auth.user_id]);res.json({duties:r.rows});}catch(e){next(e);}});
+app.post("/api/duties/:id/favorite",requireAuth,async(req,res,next)=>{try{if(!/^\d+$/.test(String(req.params.id)))return res.status(400).json({error:"Invalid duty ID"});const d=await pool.query("SELECT id FROM duties WHERE id=$1",[req.params.id]);if(!d.rowCount)return res.status(404).json({error:"Duty not found"});await pool.query("INSERT INTO user_favorite_duties(user_id,duty_id) VALUES($1,$2) ON CONFLICT DO NOTHING",[req.auth.user_id,req.params.id]);res.json({ok:true,saved:true});}catch(e){next(e);}});
+app.delete("/api/duties/:id/favorite",requireAuth,async(req,res,next)=>{try{if(!/^\d+$/.test(String(req.params.id)))return res.status(400).json({error:"Invalid duty ID"});await pool.query("DELETE FROM user_favorite_duties WHERE user_id=$1 AND duty_id=$2",[req.auth.user_id,req.params.id]);res.json({ok:true,saved:false});}catch(e){next(e);}});
+app.post("/api/duties/:id/report",requireAuth,async(req,res,next)=>{try{if(!/^\d+$/.test(String(req.params.id)))return res.status(400).json({error:"Invalid duty ID"});const reason=String(req.body.reason||"").trim().slice(0,80),details=String(req.body.details||"").trim().slice(0,1000);if(!["fake_duty","wrong_contact","misleading_details","spam","other"].includes(reason))return res.status(400).json({error:"शिकायत का कारण चुनें।"});const d=await pool.query("SELECT user_id FROM duties WHERE id=$1",[req.params.id]);if(!d.rowCount)return res.status(404).json({error:"Duty not found"});if(String(d.rows[0].user_id)===String(req.auth.user_id))return res.status(400).json({error:"आप अपनी ही ड्यूटी रिपोर्ट नहीं कर सकते।"});const r=await pool.query(`INSERT INTO duty_reports(duty_id,reporter_user_id,reason,details) VALUES($1,$2,$3,$4) ON CONFLICT(duty_id,reporter_user_id) DO UPDATE SET reason=EXCLUDED.reason,details=EXCLUDED.details,status='pending',created_at=now() RETURNING id,status`,[req.params.id,req.auth.user_id,reason,details]);res.status(201).json({ok:true,report:r.rows[0]});}catch(e){next(e);}});
+
 app.get("/api/duties", requireAuth, async (req, res, next) => {
   try {
+    await ensureWhatsAppDutySchema();
     const pickup = String(req.query.pickup || "")
       .trim()
       .slice(0, 120);
@@ -1206,10 +1068,10 @@ app.get("/api/duties", requireAuth, async (req, res, next) => {
       .slice(0, 120);
     const r = await pool.query(
       `SELECT d.id,d.user_id,d.role_posted_as,d.pickup_city,d.pickup_address_private,d.drop_city,d.drop_address_private,d.vehicle_type,d.trip_type,
-      d.duty_date,d.duty_time,d.payout_paise,d.notes_private,d.distance_km,d.distance_label,d.created_at,d.status,
-      (d.user_id=$3) AS is_owner, (d.accepted_by_user_id=$3) AS accepted_by_me, u.name AS poster_name, u.phone AS poster_phone
+      d.duty_date,d.duty_time,d.payout_paise,d.notes_private,d.distance_km,d.distance_label,d.created_at,d.status,d.source_type,
+      (d.user_id=$3 AND d.source_type IS DISTINCT FROM 'whatsapp') AS is_owner, (d.accepted_by_user_id=$3) AS accepted_by_me, CASE WHEN d.source_type='whatsapp' THEN d.source_poster_name ELSE u.name END AS poster_name, CASE WHEN d.source_type='whatsapp' THEN d.source_poster_phone ELSE u.phone END AS poster_phone, d.source_group AS source_group, d.source_poster_name AS source_poster_name, d.is_featured, u.driver_verification, u.vendor_verification
       FROM duties d JOIN users u ON u.id=d.user_id WHERE d.status='open' AND ($1='' OR d.pickup_city ILIKE '%'||$1||'%')
-      AND ($2='' OR d.drop_city ILIKE '%'||$2||'%') ORDER BY d.created_at DESC LIMIT 100`,
+      AND ($2='' OR d.drop_city ILIKE '%'||$2||'%') ORDER BY d.is_featured DESC, d.created_at DESC LIMIT 100`,
       [pickup, drop, req.auth.user_id]
     );
     const active = await hasActiveMembership(req.auth.user_id);
@@ -1222,16 +1084,16 @@ app.get("/api/duties", requireAuth, async (req, res, next) => {
       // The person who posted a duty always sees its full details, regardless of membership.
       // Other subscribers see full details immediately; other non-subscribers unlock them after five minutes.
       // Compare IDs as strings too, so the duty poster is never locked by a boolean/type mismatch.
-      const isOwner =
-        d.is_owner === true || String(d.user_id) === String(req.auth.user_id);
-      const detailsAvailable = isOwner || active || secondsRemaining === 0;
+      const isOwner = d.is_owner === true || (String(d.user_id) === String(req.auth.user_id) && d.source_type !== "whatsapp");
+      const isImporter = d.source_type === "whatsapp" && String(d.user_id) === String(req.auth.user_id);
+      const detailsAvailable = isOwner || isImporter || active || secondsRemaining === 0;
       const basic = {
         ...privateDuty(d),
         isOwner,
         detailsAvailable,
-        freeWindowSecondsRemaining: isOwner || active ? null : secondsRemaining,
+        freeWindowSecondsRemaining: isOwner || isImporter || active ? null : secondsRemaining,
         membershipRequiredAfterFreeWindow:
-          !isOwner && !active && secondsRemaining === 0,
+          !isOwner && !isImporter && !active && secondsRemaining === 0,
       };
       if (detailsAvailable)
         return {
@@ -1249,6 +1111,7 @@ app.get("/api/duties", requireAuth, async (req, res, next) => {
     res.json({
       duties,
       membershipActive: active,
+      membershipDecisionSource: active ? "server_verified_membership" : "free_window_or_unpaid",
       privateDetailsRule:
         "duty owner always sees full details; subscribers see full details immediately; other non-subscribers see full details after the first 5 minutes",
     });
@@ -1486,11 +1349,12 @@ app.post("/api/duties/:id/booked", requireAuth, async (req, res, next) => {
 });
 app.get("/api/duties/accepted", requireAuth, async (req, res, next) => {
   try {
+    await ensureWhatsAppDutySchema();
     const r = await pool.query(
       `SELECT d.id,d.user_id,d.role_posted_as,d.pickup_city,d.pickup_address_private,d.drop_city,d.drop_address_private,
       d.vehicle_type,d.trip_type,d.duty_date,d.duty_time,d.payout_paise,d.notes_private,d.distance_km,d.distance_label,d.created_at,d.status,
-      (d.user_id=$1) AS is_owner, (d.accepted_by_user_id=$1) AS accepted_by_me, u.name AS poster_name, u.phone AS poster_phone
-      FROM duties d JOIN users u ON u.id=d.user_id WHERE d.accepted_by_user_id=$1 ORDER BY d.created_at DESC LIMIT 100`,
+      (d.user_id=$1) AS is_owner, (d.accepted_by_user_id=$1) AS accepted_by_me, CASE WHEN d.source_type='whatsapp' THEN d.source_poster_name ELSE u.name END AS poster_name, CASE WHEN d.source_type='whatsapp' THEN d.source_poster_phone ELSE u.phone END AS poster_phone, d.source_group AS source_group, d.source_poster_name AS source_poster_name
+      FROM duties d JOIN users u ON u.id=d.user_id WHERE d.accepted_by_user_id=$1 ORDER BY d.is_featured DESC, d.created_at DESC LIMIT 100`,
       [req.auth.user_id]
     );
     res.json({
@@ -1498,6 +1362,9 @@ app.get("/api/duties/accepted", requireAuth, async (req, res, next) => {
         ...privateDuty(d),
         posterName: d.poster_name,
         posterPhone: d.poster_phone,
+        sourcePosterName: d.source_poster_name,
+        sourceGroup: d.source_group,
+        sourceType: d.source_type,
         pickupAddress: d.pickup_address_private,
         dropAddress: d.drop_address_private,
         payoutRupees: d.payout_paise == null ? null : d.payout_paise / 100,
@@ -1512,8 +1379,9 @@ app.get("/api/duties/accepted", requireAuth, async (req, res, next) => {
 
 app.get("/api/duties/mine", requireAuth, async (req, res, next) => {
   try {
+    await ensureWhatsAppDutySchema();
     const r = await pool.query(
-      `SELECT id,role_posted_as,pickup_city,pickup_address_private,drop_city,drop_address_private,vehicle_type,trip_type,duty_date,duty_time,payout_paise,notes_private,distance_km,distance_label,created_at,status,
+      `SELECT id,role_posted_as,pickup_city,pickup_address_private,drop_city,drop_address_private,vehicle_type,trip_type,duty_date,duty_time,payout_paise,notes_private,distance_km,distance_label,created_at,status,source_type,source_group,source_poster_name,source_poster_phone,
       (user_id=$1) AS is_owner
       FROM duties WHERE user_id=$1 ORDER BY created_at DESC LIMIT 100`,
       [req.auth.user_id]
@@ -1522,6 +1390,11 @@ app.get("/api/duties/mine", requireAuth, async (req, res, next) => {
       duties: r.rows.map((d) => ({
         ...privateDuty(d),
         rolePostedAs: d.role_posted_as,
+        posterName: d.source_type === 'whatsapp' ? d.source_poster_name : req.auth.name,
+        posterPhone: d.source_type === 'whatsapp' ? d.source_poster_phone : req.auth.phone,
+        sourcePosterName: d.source_poster_name,
+        sourceGroup: d.source_group,
+        sourceType: d.source_type,
         pickupAddress: d.pickup_address_private,
         dropAddress: d.drop_address_private,
         payoutRupees: d.payout_paise == null ? null : d.payout_paise / 100,
@@ -2445,4 +2318,9 @@ app.get(
       next(e);
     }
   }
-); /* END GUDIYA TAXI PARTNER ADMIN API ROUTES */ // Admin endpoints: protect with a separate high-entropy key configured only on the server. app.get( "/api/admin/documents/pending", requireAdmin, async (_req, res, next) => { try { const r = await pool.query(` SELECT id, user_id, document_type, status, created_at FROM driver_documents WHERE status='pending' ORDER BY created_at ASC LIMIT 200 `); res.json({ documents: r.rows }); } catch (e) { next(e); } } ); app.get( "/api/admin/documents/:id/content", requireAdmin, async (req, res, next) => { try { if (!/^\\d+$/.test(String(req.params.id || ""))) { return res.status(400).json({ error: "Invalid document ID" }); } const r = await pool.query( "SELECT document_type, encrypted_payload FROM driver_documents WHERE id=$1", [req.params.id] ); if (!r.rowCount || !r.rows[0].encrypted_payload) { return res.status(404).json({ error: "Encrypted document not found" }); } const doc = JSON.parse( decryptDocument(r.rows[0].encrypted_payload).toString("utf8") ); const bytes = Buffer.from(doc.dataBase64, "base64"); const safeFilename = String(doc.filename || "document").replace( /[\\r\\n"\\\\]/g, "_" ); res.set("Content-Type", doc.mime || "application/octet-stream"); res.set("Content-Disposition", `attachment; filename="${safeFilename}"`); res.set("Cache-Control", "no-store"); res.send(bytes); } catch (e) { next(e); } } ); app.post( "/api/admin/documents/:id/review", requireAdmin, async (req, res, next) => { try { const status = String(req.body.status || ""); if (!["approved", "rejected"].includes(status)) return res .status(400) .json({ error: "status must be approved or rejected" }); const client = await pool.connect(); try { await client.query("BEGIN"); const doc = await client.query( `UPDATE driver_documents SET status=$1,reviewer_note=$2,reviewed_at=now() WHERE id=$3 AND lower(trim(status))='pending' RETURNING user_id`, [status, String(req.body.note || "").slice(0, 500), req.params.id] ); if (!doc.rowCount) { await client.query("ROLLBACK"); return res.status(404).json({ error: "Pending document not found" }); } const docType = await client.query( "SELECT document_type FROM driver_documents WHERE id=$1", [req.params.id] ); const category = docType.rows[0]?.document_type?.startsWith("vendor_") ? "vendor" : "driver"; const types = category === "vendor" ? ["vendor_aadhaar"] : ["aadhaar", "driving_licence", "vehicle_rc"]; const pending = await client.query( `SELECT count(*)::int AS n FROM driver_documents WHERE user_id=$1 AND document_type = ANY($2::text[]) AND lower(trim(status))='pending'`, [doc.rows[0].user_id, types] ); const rejected = await client.query( `SELECT count(*)::int AS n FROM driver_documents WHERE user_id=$1 AND document_type = ANY($2::text[]) AND lower(trim(status))='rejected'`, [doc.rows[0].user_id, types] ); const approved = await client.query( `SELECT count(*)::int AS n FROM driver_documents WHERE user_id=$1 AND document_type = ANY($2::text[]) AND lower(trim(status))='approved'`, [doc.rows[0].user_id, types] ); let verify = "pending"; if (Number(rejected.rows[0].n) > 0) verify = "rejected"; else if ( Number(pending.rows[0].n) === 0 && Number(approved.rows[0].n) >= (category === "vendor" ? 1 : 3) ) verify = "approved"; const column = category === "vendor" ? "vendor_verification" : "driver_verification"; await client.query( `UPDATE users SET ${column}=$1,updated_at=now() WHERE id=$2`, [verify, doc.rows[0].user_id] ); await qualifyReferralIfEligible(client, doc.rows[0].user_id); await client.query( "INSERT INTO audit_log(action,subject_type,subject_id,details) VALUES($1,$2,$3,$4)", [ category + "_document_review", "driver_document", String(req.params.id), JSON.stringify({ status, verify }), ] ); await client.query("COMMIT"); void sendPushToUserIds( [doc.rows[0].user_id], status === "approved" ? "दस्तावेज़ स्वीकृत हुए" : "दस्तावेज़ में सुधार आवश्यक", status === "approved" ? "आपके दस्तावेज़ स्वीकृत कर दिए गए हैं।" : "आपके दस्तावेज़ अस्वीकृत हुए हैं। कृपया ऐप में स्थिति देखें।", { type: "document_status", status, category } ); res.json({ ok: true, category, verification: verify }); } catch (e) { await client.query("ROLLBACK"); throw e; } finally { client.release(); } } catch (e) { next(e); } } ); app.use((err, _req, res, _next) => { console.error(err.message); const status = Number(err.status) || 500; res .status(status) .json({ error: status < 500 ? err.message : "Server error" }); }); // Bootstrap the complete schema before accepting requests. // Serialize startup migrations across overlapping Render instances to prevent DDL deadlocks. const schemaCandidates = [ path.join(__dirname, "schema.sql"), path.join(__dirname, "..", "schema.sql"), path.join(process.cwd(), "schema.sql"), path.join(process.cwd(), "src", "schema.sql"), ]; const schemaPath = schemaCandidates.find((candidate) => fs.existsSync(candidate) ); if (!schemaPath) { throw new Error( "schema.sql not found. Checked: " + schemaCandidates.join(", ") + ". Ensure schema.sql is committed to the deployed repository root." ); } async function initializeDatabase() { const client = await pool.connect(); let transactionOpen = false; try { await client.query("BEGIN"); transactionOpen = true; // All app instances use the same transaction-scoped lock key. // A second instance waits here instead of running ALTER/CREATE concurrently. await client.query("SELECT pg_advisory_xact_lock($1)", [741029316]); console.log("Loading database schema from:", schemaPath); const schemaSql = fs.readFileSync(schemaPath, "utf8"); await client.query(schemaSql); await client.query( "ALTER TABLE duties ADD COLUMN IF NOT EXISTS trip_type TEXT NOT NULL DEFAULT 'one_way'" ); await client.query( "ALTER TABLE duties DROP CONSTRAINT IF EXISTS duties_trip_type_check" ); await client.query( "ALTER TABLE duties ADD CONSTRAINT duties_trip_type_check CHECK (trip_type IN ('one_way','round_trip','local_booking'))" ); await client.query( "ALTER TABLE users ADD COLUMN IF NOT EXISTS password_hash TEXT" ); await client.query( "ALTER TABLE users ADD COLUMN IF NOT EXISTS referral_code TEXT" ); await client.query( "ALTER TABLE users ADD COLUMN IF NOT EXISTS referred_by_user_id BIGINT REFERENCES users(id) ON DELETE SET NULL" ); await client.query( "ALTER TABLE users ADD COLUMN IF NOT EXISTS first_paid_membership_at TIMESTAMPTZ" ); await client.query( "ALTER TABLE users ADD COLUMN IF NOT EXISTS referral_qualified_at TIMESTAMPTZ" ); await client.query(` UPDATE users SET referral_code='GTP' || upper(substr(md5(id::text || random()::text),1,10)) WHERE referral_code IS NULL `); await client.query( "CREATE UNIQUE INDEX IF NOT EXISTS users_referral_code_unique ON users(referral_code)" ); await client.query(` CREATE TABLE IF NOT EXISTS referral_reward_events ( id BIGSERIAL PRIMARY KEY, referrer_user_id BIGINT NOT NULL REFERENCES users(id) ON DELETE CASCADE, milestone INTEGER NOT NULL CHECK (milestone IN (15,50)), months_awarded INTEGER NOT NULL CHECK (months_awarded IN (1,2)), subscription_id BIGINT REFERENCES subscriptions(id) ON DELETE SET NULL, created_at TIMESTAMPTZ NOT NULL DEFAULT now(), UNIQUE(referrer_user_id,milestone) ) `); await client.query( "ALTER TABLE users ADD COLUMN IF NOT EXISTS vendor_verification TEXT NOT NULL DEFAULT 'not_submitted'" ); await client.query( "ALTER TABLE driver_documents ADD COLUMN IF NOT EXISTS encrypted_payload TEXT" ); await client.query( "ALTER TABLE driver_documents DROP CONSTRAINT IF EXISTS driver_documents_document_type_check" ); await client.query( "ALTER TABLE driver_documents ADD CONSTRAINT driver_documents_document_type_check CHECK (document_type IN ('aadhaar','vendor_aadhaar','driving_licence','vehicle_rc','vendor_gst','vendor_pan'))" ); await client.query(` CREATE TABLE IF NOT EXISTS membership_payment_requests ( id BIGSERIAL PRIMARY KEY, user_id BIGINT NOT NULL REFERENCES users(id) ON DELETE CASCADE, plan_months INTEGER NOT NULL CHECK (plan_months IN (1,3,6)), amount_rupees INTEGER NOT NULL CHECK (amount_rupees IN (51,151,301)), utr VARCHAR(40) NOT NULL UNIQUE, status TEXT NOT NULL DEFAULT 'pending' CHECK (status IN ('pending','approved','rejected')), admin_note TEXT, created_at TIMESTAMPTZ NOT NULL DEFAULT now(), reviewed_at TIMESTAMPTZ, reviewed_by TEXT ) `); await client.query(` CREATE TABLE IF NOT EXISTS admin_membership_overrides ( user_id BIGINT PRIMARY KEY REFERENCES users(id) ON DELETE CASCADE, status TEXT NOT NULL CHECK (status IN ('paid','unpaid')), note TEXT NOT NULL DEFAULT '', updated_at TIMESTAMPTZ NOT NULL DEFAULT now() ) `); await client.query("CREATE TABLE IF NOT EXISTS admin_notifications (id BIGSERIAL PRIMARY KEY, title TEXT NOT NULL, body TEXT NOT NULL, kind TEXT NOT NULL DEFAULT 'info', is_read BOOLEAN NOT NULL DEFAULT false, created_at TIMESTAMPTZ NOT NULL DEFAULT now())"); await client.query("COMMIT"); transactionOpen = false; databaseReady = true; console.log("Database schema initialized successfully. databaseReady=true"); } catch (error) { if (transactionOpen) { try { await client.query("ROLLBACK"); } catch (_) {} } throw error; } finally { client.release(); } } async function startServerWithDatabaseRetry() { // HTTP listener is already active; initialize the database in the background. databaseReady = false; let attempt = 0; while (true) { attempt += 1; try { console.log(`Starting database initialization attempt ${attempt}...`); await initializeDatabase(); console.log("Database initialization completed. API is ready."); return; } catch (error) { console.error( `Database initialization attempt ${attempt} failed:`, JSON.stringify({ code: error.code || "NO_CODE", message: error.message || String(error), detail: error.detail || null, hint: error.hint || null, table: error.table || null, constraint: error.constraint || null, stack: error.stack || null, }) ); const waitMs = Math.min(attempt * 5000, 30000); console.warn( `Database initialization will retry in ${waitMs / 1000} seconds.` ); await new Promise((resolve) => setTimeout(resolve, waitMs)); } } } startServerWithDatabaseRetry();
+); /* END GUDIYA TAXI PARTNER ADMIN API ROUTES */ // Admin endpoints: protect with a separate high-entropy key configured only on the server. app.get( "/api/admin/documents/pending", requireAdmin, async (_req, res, next) => { try { const r = await pool.query(` SELECT id, user_id, document_type, status, created_at FROM driver_documents WHERE status='pending' ORDER BY created_at ASC LIMIT 200 `); res.json({ documents: r.rows }); } catch (e) { next(e); } } ); app.get( "/api/admin/documents/:id/content", requireAdmin, async (req, res, next) => { try { if (!/^\d+$/.test(String(req.params.id || ""))) { return res.status(400).json({ error: "Invalid document ID" }); } const r = await pool.query( "SELECT document_type, encrypted_payload FROM driver_documents WHERE id=$1", [req.params.id] ); if (!r.rowCount || !r.rows[0].encrypted_payload) { return res.status(404).json({ error: "Encrypted document not found" }); } const doc = JSON.parse( decryptDocument(r.rows[0].encrypted_payload).toString("utf8") ); const bytes = Buffer.from(doc.dataBase64, "base64"); const safeFilename = String(doc.filename || "document").replace( /[\\r\\n"\\\\]/g, "_" ); res.set("Content-Type", doc.mime || "application/octet-stream"); res.set("Content-Disposition", `attachment; filename="${safeFilename}"`); res.set("Cache-Control", "no-store"); res.send(bytes); } catch (e) { next(e); } } ); app.post( "/api/admin/documents/:id/review", requireAdmin, async (req, res, next) => { try { const status = String(req.body.status || ""); if (!["approved", "rejected"].includes(status)) return res .status(400) .json({ error: "status must be approved or rejected" }); const client = await pool.connect(); try { await client.query("BEGIN"); const doc = await client.query( `UPDATE driver_documents SET status=$1,reviewer_note=$2,reviewed_at=now() WHERE id=$3 AND lower(trim(status))='pending' RETURNING user_id`, [status, String(req.body.note || "").slice(0, 500), req.params.id] ); if (!doc.rowCount) { await client.query("ROLLBACK"); return res.status(404).json({ error: "Pending document not found" }); } const docType = await client.query( "SELECT document_type FROM driver_documents WHERE id=$1", [req.params.id] ); const category = docType.rows[0]?.document_type?.startsWith("vendor_") ? "vendor" : "driver"; const types = category === "vendor" ? ["vendor_aadhaar"] : ["aadhaar", "driving_licence", "vehicle_rc"]; const pending = await client.query( `SELECT count(*)::int AS n FROM driver_documents WHERE user_id=$1 AND document_type = ANY($2::text[]) AND lower(trim(status))='pending'`, [doc.rows[0].user_id, types] ); const rejected = await client.query( `SELECT count(*)::int AS n FROM driver_documents WHERE user_id=$1 AND document_type = ANY($2::text[]) AND lower(trim(status))='rejected'`, [doc.rows[0].user_id, types] ); const approved = await client.query( `SELECT count(*)::int AS n FROM driver_documents WHERE user_id=$1 AND document_type = ANY($2::text[]) AND lower(trim(status))='approved'`, [doc.rows[0].user_id, types] ); let verify = "pending"; if (Number(rejected.rows[0].n) > 0) verify = "rejected"; else if ( Number(pending.rows[0].n) === 0 && Number(approved.rows[0].n) >= (category === "vendor" ? 1 : 3) ) verify = "approved"; const column = category === "vendor" ? "vendor_verification" : "driver_verification"; await client.query( `UPDATE users SET ${column}=$1,updated_at=now() WHERE id=$2`, [verify, doc.rows[0].user_id] ); await qualifyReferralIfEligible(client, doc.rows[0].user_id); await client.query( "INSERT INTO audit_log(action,subject_type,subject_id,details) VALUES($1,$2,$3,$4)", [ category + "_document_review", "driver_document", String(req.params.id), JSON.stringify({ status, verify }), ] ); await client.query("COMMIT"); void sendPushToUserIds( [doc.rows[0].user_id], status === "approved" ? "दस्तावेज़ स्वीकृत हुए" : "दस्तावेज़ में सुधार आवश्यक", status === "approved" ? "आपके दस्तावेज़ स्वीकृत कर दिए गए हैं।" : "आपके दस्तावेज़ अस्वीकृत हुए हैं। कृपया ऐप में स्थिति देखें।", { type: "document_status", status, category } ); res.json({ ok: true, category, verification: verify }); } catch (e) { await client.query("ROLLBACK"); throw e; } finally { client.release(); } } catch (e) { next(e); } } ); // Admin moderation and Featured Duty controls.
+app.get("/api/admin/duty-reports",requireAdmin,async(req,res,next)=>{try{const status=["pending","reviewed","dismissed","actioned"].includes(String(req.query.status||""))?String(req.query.status):"pending";const r=await pool.query(`SELECT r.id,r.duty_id,r.reason,r.details,r.status,r.created_at,u.name AS reporter_name,u.phone AS reporter_phone,d.pickup_city,d.drop_city,d.user_id AS poster_user_id FROM duty_reports r JOIN users u ON u.id=r.reporter_user_id JOIN duties d ON d.id=r.duty_id WHERE r.status=$1 ORDER BY r.created_at DESC LIMIT 300`,[status]);res.json({reports:r.rows});}catch(e){next(e);}});
+app.post("/api/admin/duty-reports/:id/review",requireAdmin,async(req,res,next)=>{try{if(!/^\d+$/.test(String(req.params.id)))return res.status(400).json({error:"Invalid report ID"});const status=String(req.body.status||"");if(!["reviewed","dismissed","actioned"].includes(status))return res.status(400).json({error:"Invalid report status"});const r=await pool.query("UPDATE duty_reports SET status=$1,admin_note=$2,reviewed_at=now(),reviewed_by=$3 WHERE id=$4 RETURNING id,status",[status,String(req.body.note||"").slice(0,1000),req.admin?.username||"admin",req.params.id]);if(!r.rowCount)return res.status(404).json({error:"Report not found"});res.json({ok:true,report:r.rows[0]});}catch(e){next(e);}});
+app.post("/api/admin/duties/:id/featured",requireAdmin,async(req,res,next)=>{try{if(!/^\d+$/.test(String(req.params.id)))return res.status(400).json({error:"Invalid duty ID"});const r=await pool.query("UPDATE duties SET is_featured=$1 WHERE id=$2 RETURNING id,is_featured",[req.body.featured===true,req.params.id]);if(!r.rowCount)return res.status(404).json({error:"Duty not found"});broadcastDutyUpdate();res.json({ok:true,duty:r.rows[0]});}catch(e){next(e);}});
+
+app.use((err, _req, res, _next) => { console.error(err.message); const status = Number(err.status) || 500; res .status(status) .json({ error: status < 500 ? err.message : "Server error" }); }); // Bootstrap the complete schema before accepting requests. // Serialize startup migrations across overlapping Render instances to prevent DDL deadlocks. const schemaCandidates = [ path.join(__dirname, "schema.sql"), path.join(__dirname, "..", "schema.sql"), path.join(process.cwd(), "schema.sql"), path.join(process.cwd(), "src", "schema.sql"), ]; const schemaPath = schemaCandidates.find((candidate) => fs.existsSync(candidate) ); if (!schemaPath) { throw new Error( "schema.sql not found. Checked: " + schemaCandidates.join(", ") + ". Ensure schema.sql is committed to the deployed repository root." ); } async function initializeDatabase() { const client = await pool.connect(); let transactionOpen = false; try { await client.query("BEGIN"); transactionOpen = true; // All app instances use the same transaction-scoped lock key. // A second instance waits here instead of running ALTER/CREATE concurrently. await client.query("SELECT pg_advisory_xact_lock($1)", [741029316]); console.log("Loading database schema from:", schemaPath); const schemaSql = fs.readFileSync(schemaPath, "utf8"); await client.query(schemaSql); await client.query( "ALTER TABLE duties ADD COLUMN IF NOT EXISTS trip_type TEXT NOT NULL DEFAULT 'one_way'" ); await client.query( "ALTER TABLE duties DROP CONSTRAINT IF EXISTS duties_trip_type_check" ); await client.query( "ALTER TABLE duties ADD CONSTRAINT duties_trip_type_check CHECK (trip_type IN ('one_way','round_trip','local_booking'))" ); await client.query( "ALTER TABLE users ADD COLUMN IF NOT EXISTS password_hash TEXT" ); await client.query( "ALTER TABLE users ADD COLUMN IF NOT EXISTS referral_code TEXT" ); await client.query( "ALTER TABLE users ADD COLUMN IF NOT EXISTS referred_by_user_id BIGINT REFERENCES users(id) ON DELETE SET NULL" ); await client.query( "ALTER TABLE users ADD COLUMN IF NOT EXISTS first_paid_membership_at TIMESTAMPTZ" ); await client.query( "ALTER TABLE users ADD COLUMN IF NOT EXISTS referral_qualified_at TIMESTAMPTZ" ); await client.query(` UPDATE users SET referral_code='GTP' || upper(substr(md5(id::text || random()::text),1,10)) WHERE referral_code IS NULL `); await client.query( "CREATE UNIQUE INDEX IF NOT EXISTS users_referral_code_unique ON users(referral_code)" ); await client.query(` CREATE TABLE IF NOT EXISTS referral_reward_events ( id BIGSERIAL PRIMARY KEY, referrer_user_id BIGINT NOT NULL REFERENCES users(id) ON DELETE CASCADE, milestone INTEGER NOT NULL CHECK (milestone IN (15,50)), months_awarded INTEGER NOT NULL CHECK (months_awarded IN (1,2)), subscription_id BIGINT REFERENCES subscriptions(id) ON DELETE SET NULL, created_at TIMESTAMPTZ NOT NULL DEFAULT now(), UNIQUE(referrer_user_id,milestone) ) `); await client.query( "ALTER TABLE users ADD COLUMN IF NOT EXISTS vendor_verification TEXT NOT NULL DEFAULT 'not_submitted'" ); await client.query( "ALTER TABLE driver_documents ADD COLUMN IF NOT EXISTS encrypted_payload TEXT" ); await client.query( "ALTER TABLE driver_documents DROP CONSTRAINT IF EXISTS driver_documents_document_type_check" ); await client.query( "ALTER TABLE driver_documents ADD CONSTRAINT driver_documents_document_type_check CHECK (document_type IN ('aadhaar','vendor_aadhaar','driving_licence','vehicle_rc','vendor_gst','vendor_pan'))" ); await client.query(` CREATE TABLE IF NOT EXISTS membership_payment_requests ( id BIGSERIAL PRIMARY KEY, user_id BIGINT NOT NULL REFERENCES users(id) ON DELETE CASCADE, plan_months INTEGER NOT NULL CHECK (plan_months IN (1,3,6)), amount_rupees INTEGER NOT NULL CHECK (amount_rupees IN (51,151,301)), utr VARCHAR(40) NOT NULL UNIQUE, status TEXT NOT NULL DEFAULT 'pending' CHECK (status IN ('pending','approved','rejected')), admin_note TEXT, created_at TIMESTAMPTZ NOT NULL DEFAULT now(), reviewed_at TIMESTAMPTZ, reviewed_by TEXT ) `); await client.query(` CREATE TABLE IF NOT EXISTS admin_membership_overrides ( user_id BIGINT PRIMARY KEY REFERENCES users(id) ON DELETE CASCADE, status TEXT NOT NULL CHECK (status IN ('paid','unpaid')), note TEXT NOT NULL DEFAULT '', updated_at TIMESTAMPTZ NOT NULL DEFAULT now() ) `); await client.query("CREATE TABLE IF NOT EXISTS admin_notifications (id BIGSERIAL PRIMARY KEY, title TEXT NOT NULL, body TEXT NOT NULL, kind TEXT NOT NULL DEFAULT 'info', is_read BOOLEAN NOT NULL DEFAULT false, created_at TIMESTAMPTZ NOT NULL DEFAULT now())"); await client.query("COMMIT"); transactionOpen = false; databaseReady = true; console.log("Database schema initialized successfully. databaseReady=true"); } catch (error) { if (transactionOpen) { try { await client.query("ROLLBACK"); } catch (_) {} } throw error; } finally { client.release(); } } async function startServerWithDatabaseRetry() { // HTTP listener is already active; initialize the database in the background. databaseReady = false; let attempt = 0; while (true) { attempt += 1; try { console.log(`Starting database initialization attempt ${attempt}...`); await initializeDatabase(); console.log("Database initialization completed. API is ready."); return; } catch (error) { console.error( `Database initialization attempt ${attempt} failed:`, JSON.stringify({ code: error.code || "NO_CODE", message: error.message || String(error), detail: error.detail || null, hint: error.hint || null, table: error.table || null, constraint: error.constraint || null, stack: error.stack || null, }) ); const waitMs = Math.min(attempt * 5000, 30000); console.warn( `Database initialization will retry in ${waitMs / 1000} seconds.` ); await new Promise((resolve) => setTimeout(resolve, waitMs)); } } } startServerWithDatabaseRetry();
