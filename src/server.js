@@ -491,6 +491,16 @@ async function qualifyReferralIfEligible(client, userId) {
   }
 }
 
+function extractIndianMobile(value) {
+  const matches = String(value || "").match(/(?:\+?91[\s-]?)?([6-9]\d{9})(?!\d)/g) || [];
+  for (const match of matches) {
+    const digits = match.replace(/\D/g, "");
+    const mobile = digits.length > 10 ? digits.slice(-10) : digits;
+    if (/^[6-9]\d{9}$/.test(mobile)) return mobile;
+  }
+  return null;
+}
+
 function privateDuty(d) {
   return {
     id: d.id,
@@ -1028,7 +1038,7 @@ app.post("/api/admin/whatsapp-duties/:id/publish", requireAdmin, async(req,res,n
     }
     const duty = await client.query(`INSERT INTO duties(user_id,role_posted_as,pickup_city,drop_city,vehicle_type,trip_type,duty_date,duty_time,payout_paise,notes_private,distance_label,source_type,source_group,source_poster_name,source_poster_phone)
       VALUES($1,'vendor',$2,$3,$4,$5,$6,$7,$8,$9,'लगभग दूरी','whatsapp',$10,$11,$12) RETURNING id`,
-      [vendor.rows[0].id,pickup,drop,vehicle,trip,dutyDate,dutyTime || null,payout,String(inbox.rows[0].message_text).slice(0,1000),inbox.rows[0].group_name,inbox.rows[0].sender_name,inbox.rows[0].sender_phone]);
+      [vendor.rows[0].id,pickup,drop,vehicle,trip,dutyDate,dutyTime || null,payout,String(inbox.rows[0].message_text).slice(0,1000),inbox.rows[0].group_name,inbox.rows[0].sender_name,(inbox.rows[0].sender_phone || extractIndianMobile(inbox.rows[0].message_text))]);
     await client.query("UPDATE admin_whatsapp_duties SET status='published',duty_id=$2,reviewed_at=now() WHERE id=$1",[id,duty.rows[0].id]);
     await client.query("INSERT INTO audit_log(action,subject_type,subject_id,details) VALUES('whatsapp_duty_published','duty',$1,$2)",
       [String(duty.rows[0].id),JSON.stringify({inboxId:id,admin:req.admin?.username || "admin"})]);
@@ -1055,8 +1065,9 @@ app.post("/api/duties/import/whatsapp", requireAuth, async (req, res, next) => {
     const groupName = String(req.body.groupName || "").trim().slice(0, 180);
     const senderName = String(req.body.senderName || "").trim().slice(0, 180);
     const senderPhoneRaw = String(req.body.senderPhone || "").replace(/\D/g, "");
-    const senderPhone = /^[6-9]\d{9}$/.test(senderPhoneRaw) ? senderPhoneRaw : null;
+    const senderPhoneCandidate = /^[6-9]\d{9}$/.test(senderPhoneRaw) ? senderPhoneRaw : null;
     const message = String(req.body.message || "").trim().slice(0, 5000);
+    const senderPhone = senderPhoneCandidate || extractIndianMobile(message);
     if (!groupName || !message) return res.status(400).json({ error: "WhatsApp group and message are required" });
     // Ignore messages that do not look like a duty. Parsing is intentionally conservative.
     const routeLine = message.split(/\r?\n/).map(line => line.trim()).find(line => /\bto\b|से|→|➜/i.test(line));
@@ -1239,7 +1250,9 @@ app.get("/api/duties", requireAuth, async (req, res, next) => {
         return {
           ...basic,
           posterName: d.poster_name,
-          posterPhone: d.poster_phone,
+          // WhatsApp group posts often include the contact number in their text.
+          // Fall back to that explicitly posted number when sender metadata is absent.
+          posterPhone: d.poster_phone || (d.source_type === "whatsapp" ? extractIndianMobile(d.notes_private) : null),
           pickupAddress: d.pickup_address_private,
           dropAddress: d.drop_address_private,
           payoutRupees: d.payout_paise == null ? null : d.payout_paise / 100,
