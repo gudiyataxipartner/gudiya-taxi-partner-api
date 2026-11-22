@@ -998,6 +998,8 @@ app.post("/api/admin/whatsapp-duties/:id/publish", requireAdmin, async(req,res,n
       [String(duty.rows[0].id),JSON.stringify({inboxId:id,admin:req.admin?.username||"admin"})]);
     client.release();
     broadcastDutyUpdate();
+    const recipients = await pool.query("SELECT id FROM users WHERE id<>$1 AND (role_mode='driver' OR role_mode='both')", [vendor.rows[0].id]);
+    void sendPushToUserIds(recipients.rows.map(r=>r.id), "नई WhatsApp ड्यूटी", `${pickup} से ${drop} के लिए नई ड्यूटी उपलब्ध है।`, { type:"new_duty", dutyId:duty.rows[0].id });
     res.status(201).json({ok:true,dutyId:duty.rows[0].id});
   } catch(e) { try{client.release();}catch(_){} next(e); }
 });
