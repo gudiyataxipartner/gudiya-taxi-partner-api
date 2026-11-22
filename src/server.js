@@ -967,41 +967,65 @@ app.post("/api/admin/whatsapp-duties/:id/ignore", requireAdmin, async(req,res,ne
   } catch(e) { next(e); }
 });
 app.post("/api/admin/whatsapp-duties/:id/publish", requireAdmin, async(req,res,next) => {
-  const client=await pool.connect();
+  let client;
+  let transactionOpen = false;
   try {
     await ensureWhatsAppInboxSchema();
-    const id=Number(req.params.id);
-    const inbox=await client.query("SELECT * FROM admin_whatsapp_duties WHERE id=$1 AND status='pending' FOR UPDATE",[id]);
-    if(!inbox.rowCount) { client.release(); return res.status(404).json({error:"Pending WhatsApp duty not found"}); }
-    const b=req.body||{};
-    const pickup=String(b.pickupCity||b.pickup||"").trim().slice(0,120);
-    const drop=String(b.dropCity||b.drop||"").trim().slice(0,120);
-    const vehicle=String(b.vehicleType||b.vehicle||"").trim().slice(0,80);
-    const trip=String(b.tripType||"one_way");
-    if(!pickup||!drop||!vehicle||!["one_way","round_trip","local_booking"].includes(trip)) {
-      client.release(); return res.status(400).json({error:"Pickup, drop, vehicle and valid trip type are required"});
+    await ensureWhatsAppDutySchema();
+    const id = Number(req.params.id);
+    if (!Number.isSafeInteger(id) || id < 1) return res.status(400).json({error:"Invalid WhatsApp duty ID"});
+    const b = req.body || {};
+    const pickup = String(b.pickupCity || b.pickup || "").trim().slice(0,120);
+    const drop = String(b.dropCity || b.drop || "").trim().slice(0,120);
+    const vehicle = String(b.vehicleType || b.vehicle || "").trim().slice(0,80);
+    const trip = String(b.tripType || "one_way");
+    const dutyTime = String(b.dutyTime || "").trim();
+    const dutyDate = String(b.dutyDate || "").trim() || null;
+    if (!pickup || !drop || !vehicle || !["one_way","round_trip","local_booking"].includes(trip))
+      return res.status(400).json({error:"Pickup, drop, vehicle and valid trip type are required"});
+    if (dutyDate && !/^20\d{2}-\d{2}-\d{2}$/.test(dutyDate))
+      return res.status(400).json({error:"Invalid duty date"});
+    if (dutyTime && !/^([01]\d|2[0-3]):[0-5]\d(?::[0-5]\d)?$/.test(dutyTime))
+      return res.status(400).json({error:"Invalid duty time"});
+    const payout = b.payoutRupees == null || b.payoutRupees === "" ? null : Math.round(Number(b.payoutRupees) * 100);
+    if (payout !== null && (!Number.isFinite(payout) || payout < 0 || payout > 100000000))
+      return res.status(400).json({error:"Invalid payout"});
+    const vendorPhone = String(process.env.WHATSAPP_VENDOR_PHONE || "").replace(/\D/g,"").slice(-10);
+    if (!/^[6-9]\d{9}$/.test(vendorPhone))
+      return res.status(503).json({error:"WHATSAPP_VENDOR_PHONE is not configured as a valid Indian mobile number"});
+    client = await pool.connect();
+    await client.query("BEGIN");
+    transactionOpen = true;
+    const inbox = await client.query("SELECT * FROM admin_whatsapp_duties WHERE id=$1 AND status='pending' FOR UPDATE",[id]);
+    if (!inbox.rowCount) {
+      await client.query("ROLLBACK"); transactionOpen = false;
+      return res.status(404).json({error:"Pending WhatsApp duty not found"});
     }
-    const vendorPhone=String(process.env.WHATSAPP_VENDOR_PHONE||"").replace(/\D/g,"").slice(-10);
-    let vendor;
-    if(vendorPhone) vendor=await client.query("SELECT id FROM users WHERE regexp_replace(phone,'\\D','','g')=$1 AND role_mode IN ('vendor','both') LIMIT 1",[vendorPhone]);
-    else vendor=await client.query("SELECT id FROM users WHERE role_mode IN ('vendor','both') ORDER BY created_at ASC LIMIT 2");
-    if(!vendor.rowCount || (!vendorPhone && vendor.rowCount!==1)) {
-      client.release(); return res.status(409).json({error:"Set WHATSAPP_VENDOR_PHONE in Render to the verified vendor account phone before publishing"});
+    const vendor = await client.query(
+      "SELECT id FROM users WHERE right(regexp_replace(COALESCE(phone,''),'[^0-9]','','g'),10)=$1 AND role_mode IN ('vendor','both') LIMIT 2",
+      [vendorPhone]
+    );
+    if (vendor.rowCount !== 1) {
+      await client.query("ROLLBACK"); transactionOpen = false;
+      return res.status(409).json({error:"WHATSAPP_VENDOR_PHONE does not match exactly one Vendor/Both account"});
     }
-    const payout=b.payoutRupees==null||b.payoutRupees===""?null:Math.round(Number(b.payoutRupees)*100);
-    if(payout!==null&&(!Number.isFinite(payout)||payout<0||payout>100000000)) { client.release(); return res.status(400).json({error:"Invalid payout"}); }
-    const duty=await client.query(`INSERT INTO duties(user_id,role_posted_as,pickup_city,drop_city,vehicle_type,trip_type,duty_date,duty_time,payout_paise,notes_private,distance_label,source_type,source_group,source_poster_name,source_poster_phone)
+    const duty = await client.query(`INSERT INTO duties(user_id,role_posted_as,pickup_city,drop_city,vehicle_type,trip_type,duty_date,duty_time,payout_paise,notes_private,distance_label,source_type,source_group,source_poster_name,source_poster_phone)
       VALUES($1,'vendor',$2,$3,$4,$5,$6,$7,$8,$9,'लगभग दूरी','whatsapp',$10,$11,$12) RETURNING id`,
-      [vendor.rows[0].id,pickup,drop,vehicle,trip,b.dutyDate||null,b.dutyTime||null,payout,String(inbox.rows[0].message_text).slice(0,1000),inbox.rows[0].group_name,inbox.rows[0].sender_name,inbox.rows[0].sender_phone]);
+      [vendor.rows[0].id,pickup,drop,vehicle,trip,dutyDate,dutyTime || null,payout,String(inbox.rows[0].message_text).slice(0,1000),inbox.rows[0].group_name,inbox.rows[0].sender_name,inbox.rows[0].sender_phone]);
     await client.query("UPDATE admin_whatsapp_duties SET status='published',duty_id=$2,reviewed_at=now() WHERE id=$1",[id,duty.rows[0].id]);
     await client.query("INSERT INTO audit_log(action,subject_type,subject_id,details) VALUES('whatsapp_duty_published','duty',$1,$2)",
-      [String(duty.rows[0].id),JSON.stringify({inboxId:id,admin:req.admin?.username||"admin"})]);
-    client.release();
+      [String(duty.rows[0].id),JSON.stringify({inboxId:id,admin:req.admin?.username || "admin"})]);
+    await client.query("COMMIT"); transactionOpen = false;
+    client.release(); client = null;
     broadcastDutyUpdate();
-    const recipients = await pool.query("SELECT id FROM users WHERE id<>$1 AND (role_mode='driver' OR role_mode='both')", [vendor.rows[0].id]);
-    void sendPushToUserIds(recipients.rows.map(r=>r.id), "नई WhatsApp ड्यूटी", `${pickup} से ${drop} के लिए नई ड्यूटी उपलब्ध है।`, { type:"new_duty", dutyId:duty.rows[0].id });
-    res.status(201).json({ok:true,dutyId:duty.rows[0].id});
-  } catch(e) { try{client.release();}catch(_){} next(e); }
+    const recipients = await pool.query("SELECT id FROM users WHERE id<>$1 AND role_mode IN ('driver','both')",[vendor.rows[0].id]);
+    void sendPushToUserIds(recipients.rows.map(r=>r.id),"नई WhatsApp ड्यूटी",pickup+" से "+drop+" के लिए नई ड्यूटी उपलब्ध है।",{type:"new_duty",dutyId:duty.rows[0].id});
+    return res.status(201).json({ok:true,dutyId:duty.rows[0].id});
+  } catch(e) {
+    if (client && transactionOpen) await client.query("ROLLBACK").catch(()=>{});
+    if (client) client.release();
+    return next(e);
+  }
 });
 
 // Distance is only accepted from a trusted routing backend in a future integration.
