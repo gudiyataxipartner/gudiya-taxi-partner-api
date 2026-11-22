@@ -503,7 +503,7 @@ function privateDuty(d) {
     distanceKm: d.distance_km,
     distanceLabel: d.distance_label,
     rolePostedAs: d.role_posted_as,
-    createdAt: d.created_at,
+    createdAt: d.created_at_ist || d.created_at,
     status: d.status,
     detailsAvailable: false,
     isOwner: d.is_owner === true,
@@ -1204,7 +1204,10 @@ app.get("/api/duties", requireAuth, async (req, res, next) => {
       .slice(0, 120);
     const r = await pool.query(
       `SELECT d.id,d.user_id,d.role_posted_as,d.pickup_city,d.pickup_address_private,d.drop_city,d.drop_address_private,d.vehicle_type,d.trip_type,
-      d.duty_date,d.duty_time,d.payout_paise,d.notes_private,d.distance_km,d.distance_label,d.created_at,d.status,d.source_type,
+      d.duty_date,d.duty_time,d.payout_paise,d.notes_private,d.distance_km,d.distance_label,d.created_at,
+      to_char(d.created_at AT TIME ZONE 'Asia/Kolkata', 'DD/MM/YYYY HH12:MI AM') AS created_at_ist,
+      GREATEST(0, CEIL(300 - EXTRACT(EPOCH FROM (now() - d.created_at))))::int AS free_window_seconds_remaining,
+      d.status,d.source_type,
       (d.user_id=$3 AND d.source_type IS DISTINCT FROM 'whatsapp') AS is_owner, (d.accepted_by_user_id=$3) AS accepted_by_me, CASE WHEN d.source_type='whatsapp' THEN d.source_poster_name ELSE u.name END AS poster_name, CASE WHEN d.source_type='whatsapp' THEN d.source_poster_phone ELSE u.phone END AS poster_phone, d.source_group AS source_group, d.source_poster_name AS source_poster_name, d.is_featured, u.driver_verification, u.vendor_verification
       FROM duties d JOIN users u ON u.id=d.user_id WHERE d.status='open' AND ($1='' OR d.pickup_city ILIKE '%'||$1||'%')
       AND ($2='' OR d.drop_city ILIKE '%'||$2||'%') ORDER BY d.is_featured DESC, d.created_at DESC LIMIT 100`,
@@ -1212,10 +1215,11 @@ app.get("/api/duties", requireAuth, async (req, res, next) => {
     );
     const active = await hasActiveMembership(req.auth.user_id);
     const duties = r.rows.map((d) => {
-      const ageMs = Math.max(0, Date.now() - new Date(d.created_at).getTime());
+      // Use PostgreSQL's clock for the 5-minute window so it cannot drift
+      // when the Render Node clock and database clock differ.
       const secondsRemaining = Math.max(
         0,
-        Math.ceil((5 * 60 * 1000 - ageMs) / 1000)
+        Number(d.free_window_seconds_remaining ?? 0)
       );
       // The person who posted a duty always sees its full details, regardless of membership.
       // Other subscribers see full details immediately; other non-subscribers unlock them after five minutes.
