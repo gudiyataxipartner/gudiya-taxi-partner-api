@@ -1654,12 +1654,16 @@ app.get("/api/membership", requireAuth, async (req, res, next) => {
     );
     let subscription = r.rows[0] || null;
     const overrideResult = await pool.query(
-      `SELECT status, note, updated_at FROM admin_membership_overrides WHERE user_id=$1`,
+      `SELECT status, note, updated_at FROM admin_membership_overrides
+        WHERE user_id=$1
+        ORDER BY updated_at DESC NULLS LAST
+        LIMIT 1`,
       [req.auth.user_id]
     );
     const adminOverride = overrideResult.rows[0] || null;
+    const normalizedOverrideStatus = String(adminOverride?.status || "").trim().toLowerCase();
     const active = await hasActiveMembership(req.auth.user_id);
-    if (adminOverride?.status === "paid") {
+    if (normalizedOverrideStatus === "paid") {
       subscription = {
         status: "active",
         provider: "admin_override",
@@ -1668,7 +1672,7 @@ app.get("/api/membership", requireAuth, async (req, res, next) => {
         current_period_end: null,
         admin_note: adminOverride.note,
       };
-    } else if (adminOverride?.status === "unpaid") {
+    } else if (normalizedOverrideStatus === "unpaid") {
       subscription = {
         status: "payment_required",
         provider: "admin_override",
