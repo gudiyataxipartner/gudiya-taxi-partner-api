@@ -1416,11 +1416,16 @@ app.post("/api/duties/:id/accept", requireAuth, async (req, res, next) => {
       return res
         .status(403)
         .json({ error: "ड्यूटी स्वीकार करने के लिए ड्राइवर अकाउंट जरूरी है" });
+    // Enforce the same membership/five-minute access policy on the server.
+    // Hiding the Accept button in the app alone is not a security boundary.
+    const activeMembership = await hasActiveMembership(req.auth.user_id);
     const client = await pool.connect();
     try {
       await client.query("BEGIN");
       const found = await client.query(
-        "SELECT id,user_id,status FROM duties WHERE id=$1 FOR UPDATE",
+        `SELECT id,user_id,status,source_type,
+          GREATEST(0, CEIL(300 - EXTRACT(EPOCH FROM (now() - created_at))))::int AS free_window_seconds_remaining
+         FROM duties WHERE id=$1 FOR UPDATE`,
         [id]
       );
       if (!found.rowCount) {
@@ -1438,6 +1443,12 @@ app.post("/api/duties/:id/accept", requireAuth, async (req, res, next) => {
         await client.query("ROLLBACK");
         return res.status(409).json({
           error: "यह ड्यूटी पहले ही स्वीकार हो चुकी है या उपलब्ध नहीं है",
+        });
+      }
+      if (!activeMembership && Number(duty.free_window_seconds_remaining || 0) > 0) {
+        await client.query("ROLLBACK");
+        return res.status(403).json({
+          error: "यह ड्यूटी स्वीकार करने के लिए पहले पाँच मिनट पूरे होने चाहिए या सक्रिय सदस्यता जरूरी है।",
         });
       }
       const updated = await client.query(
