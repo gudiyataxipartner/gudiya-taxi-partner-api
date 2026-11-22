@@ -46,22 +46,6 @@ CREATE TABLE IF NOT EXISTS duties (
 );
 CREATE UNIQUE INDEX IF NOT EXISTS duties_source_message_hash_unique ON duties(source_message_hash) WHERE source_message_hash IS NOT NULL;
 CREATE INDEX IF NOT EXISTS duties_open_created ON duties(status, created_at DESC);
-CREATE TABLE IF NOT EXISTS whatsapp_duty_imports (
-  id BIGSERIAL PRIMARY KEY,
-  group_name TEXT NOT NULL,
-  sender_name TEXT NOT NULL DEFAULT '',
-  sender_phone TEXT NOT NULL DEFAULT '',
-  message_text TEXT NOT NULL,
-  message_hash TEXT NOT NULL UNIQUE,
-  status TEXT NOT NULL DEFAULT 'pending' CHECK (status IN ('pending','published','ignored')),
-  created_at TIMESTAMPTZ NOT NULL DEFAULT now(),
-  reviewed_at TIMESTAMPTZ,
-  reviewed_by TEXT,
-  published_duty_id BIGINT REFERENCES duties(id) ON DELETE SET NULL
-);
-CREATE INDEX IF NOT EXISTS whatsapp_duty_imports_status_created
-  ON whatsapp_duty_imports(status, created_at DESC);
-
 CREATE TABLE IF NOT EXISTS subscriptions (
   id BIGSERIAL PRIMARY KEY,
   user_id BIGINT NOT NULL REFERENCES users(id) ON DELETE CASCADE,
@@ -190,3 +174,12 @@ CREATE TABLE IF NOT EXISTS admin_notifications (
   is_read BOOLEAN NOT NULL DEFAULT false,
   created_at TIMESTAMPTZ NOT NULL DEFAULT now()
 );
+
+
+-- Gudiya Taxi Partner feature additions (additive / non-destructive)
+CREATE TABLE IF NOT EXISTS user_route_alert_preferences (user_id BIGINT PRIMARY KEY REFERENCES users(id) ON DELETE CASCADE, pickup_city TEXT NOT NULL DEFAULT '', drop_city TEXT NOT NULL DEFAULT '', enabled BOOLEAN NOT NULL DEFAULT TRUE, updated_at TIMESTAMPTZ NOT NULL DEFAULT now());
+CREATE TABLE IF NOT EXISTS user_favorite_duties (user_id BIGINT NOT NULL REFERENCES users(id) ON DELETE CASCADE, duty_id BIGINT NOT NULL REFERENCES duties(id) ON DELETE CASCADE, created_at TIMESTAMPTZ NOT NULL DEFAULT now(), PRIMARY KEY (user_id, duty_id));
+CREATE TABLE IF NOT EXISTS duty_reports (id BIGSERIAL PRIMARY KEY, duty_id BIGINT NOT NULL REFERENCES duties(id) ON DELETE CASCADE, reporter_user_id BIGINT NOT NULL REFERENCES users(id) ON DELETE CASCADE, reason TEXT NOT NULL, details TEXT NOT NULL DEFAULT '', status TEXT NOT NULL DEFAULT 'pending' CHECK (status IN ('pending','reviewed','dismissed','actioned')), admin_note TEXT NOT NULL DEFAULT '', created_at TIMESTAMPTZ NOT NULL DEFAULT now(), reviewed_at TIMESTAMPTZ, reviewed_by TEXT, UNIQUE (duty_id, reporter_user_id));
+ALTER TABLE duties ADD COLUMN IF NOT EXISTS is_featured BOOLEAN NOT NULL DEFAULT FALSE;
+CREATE INDEX IF NOT EXISTS duties_featured_created_idx ON duties(is_featured DESC, created_at DESC);
+CREATE INDEX IF NOT EXISTS duty_reports_status_created_idx ON duty_reports(status, created_at DESC);
