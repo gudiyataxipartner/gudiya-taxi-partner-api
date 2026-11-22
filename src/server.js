@@ -343,6 +343,28 @@ function requireAdmin(req, res, next) {
   }
   next();
 }
+
+// WhatsApp Admin inbox: additive schema; does not alter existing duty/user tables.
+let whatsappInboxSchemaReady = false;
+async function ensureWhatsAppInboxSchema() {
+  if (whatsappInboxSchemaReady) return;
+  await pool.query(`
+    CREATE TABLE IF NOT EXISTS admin_whatsapp_duties (
+      id BIGSERIAL PRIMARY KEY,
+      group_name TEXT NOT NULL,
+      sender_name TEXT,
+      sender_phone TEXT,
+      message_text TEXT NOT NULL,
+      message_hash TEXT NOT NULL UNIQUE,
+      status TEXT NOT NULL DEFAULT 'pending' CHECK (status IN ('pending','published','ignored')),
+      duty_id BIGINT,
+      created_at TIMESTAMPTZ NOT NULL DEFAULT now(),
+      reviewed_at TIMESTAMPTZ
+    )
+  `);
+  whatsappInboxSchemaReady = true;
+}
+
 async function hasActiveMembership(userId) {
   // One authoritative membership decision for both membership UI and duty details.
   // An explicit Admin override wins over payment/subscription records.
@@ -907,6 +929,78 @@ app.get("/api/driver-verification", requireAuth, async (req, res, next) => {
   } catch (e) {
     next(e);
   }
+});
+
+
+// Admin WhatsApp notification inbox endpoints used by the Admin Android app.
+app.post("/api/admin/whatsapp-duties", requireAdmin, async (req, res, next) => {
+  try {
+    await ensureWhatsAppInboxSchema();
+    const groupName = String(req.body.groupName || "").trim().slice(0,180);
+    const senderName = String(req.body.senderName || "").trim().slice(0,180);
+    const senderPhone = String(req.body.senderPhone || "").replace(/\D/g,"").slice(-10);
+    const message = String(req.body.message || req.body.messageText || "").trim().slice(0,5000);
+    if (!groupName || !message) return res.status(400).json({error:"WhatsApp group and message are required"});
+    const hash = crypto.createHash("sha256").update([groupName.toLowerCase(),senderName.toLowerCase(),senderPhone,message.toLowerCase().replace(/\s+/g," ").trim()].join("|")).digest("hex");
+    const result = await pool.query(`INSERT INTO admin_whatsapp_duties(group_name,sender_name,sender_phone,message_text,message_hash)
+      VALUES($1,$2,$3,$4,$5) ON CONFLICT(message_hash) DO NOTHING RETURNING id,status`,
+      [groupName,senderName||null,/^[6-9]\d{9}$/.test(senderPhone)?senderPhone:null,message,hash]);
+    return res.status(201).json({ok:true,duplicate:!result.rowCount,item:result.rows[0]||null});
+  } catch(e) { next(e); }
+});
+app.get("/api/admin/whatsapp-duties", requireAdmin, async (req,res,next) => {
+  try {
+    await ensureWhatsAppInboxSchema();
+    const status = ["pending","published","ignored"].includes(String(req.query.status||"")) ? String(req.query.status) : "pending";
+    const r = await pool.query(`SELECT id,group_name AS "groupName",sender_name AS "senderName",sender_phone AS "senderPhone",
+      message_text AS message,status,duty_id AS "dutyId",created_at AS "createdAt"
+      FROM admin_whatsapp_duties WHERE status=$1 ORDER BY created_at DESC LIMIT 200`,[status]);
+    res.json({items:r.rows});
+  } catch(e) { next(e); }
+});
+app.post("/api/admin/whatsapp-duties/:id/ignore", requireAdmin, async(req,res,next) => {
+  try {
+    await ensureWhatsAppInboxSchema();
+    const r=await pool.query(`UPDATE admin_whatsapp_duties SET status='ignored',reviewed_at=now()
+      WHERE id=$1 AND status='pending' RETURNING id`,[req.params.id]);
+    if(!r.rowCount) return res.status(404).json({error:"Pending WhatsApp duty not found"});
+    res.json({ok:true});
+  } catch(e) { next(e); }
+});
+app.post("/api/admin/whatsapp-duties/:id/publish", requireAdmin, async(req,res,next) => {
+  const client=await pool.connect();
+  try {
+    await ensureWhatsAppInboxSchema();
+    const id=Number(req.params.id);
+    const inbox=await client.query("SELECT * FROM admin_whatsapp_duties WHERE id=$1 AND status='pending' FOR UPDATE",[id]);
+    if(!inbox.rowCount) { client.release(); return res.status(404).json({error:"Pending WhatsApp duty not found"}); }
+    const b=req.body||{};
+    const pickup=String(b.pickupCity||b.pickup||"").trim().slice(0,120);
+    const drop=String(b.dropCity||b.drop||"").trim().slice(0,120);
+    const vehicle=String(b.vehicleType||b.vehicle||"").trim().slice(0,80);
+    const trip=String(b.tripType||"one_way");
+    if(!pickup||!drop||!vehicle||!["one_way","round_trip","local_booking"].includes(trip)) {
+      client.release(); return res.status(400).json({error:"Pickup, drop, vehicle and valid trip type are required"});
+    }
+    const vendorPhone=String(process.env.WHATSAPP_VENDOR_PHONE||"").replace(/\D/g,"").slice(-10);
+    let vendor;
+    if(vendorPhone) vendor=await client.query("SELECT id FROM users WHERE regexp_replace(phone,'\\D','','g')=$1 AND role_mode IN ('vendor','both') LIMIT 1",[vendorPhone]);
+    else vendor=await client.query("SELECT id FROM users WHERE role_mode IN ('vendor','both') ORDER BY created_at ASC LIMIT 2");
+    if(!vendor.rowCount || (!vendorPhone && vendor.rowCount!==1)) {
+      client.release(); return res.status(409).json({error:"Set WHATSAPP_VENDOR_PHONE in Render to the verified vendor account phone before publishing"});
+    }
+    const payout=b.payoutRupees==null||b.payoutRupees===""?null:Math.round(Number(b.payoutRupees)*100);
+    if(payout!==null&&(!Number.isFinite(payout)||payout<0||payout>100000000)) { client.release(); return res.status(400).json({error:"Invalid payout"}); }
+    const duty=await client.query(`INSERT INTO duties(user_id,role_posted_as,pickup_city,drop_city,vehicle_type,trip_type,duty_date,duty_time,payout_paise,notes_private,distance_label,source_type,source_group,source_poster_name,source_poster_phone)
+      VALUES($1,'vendor',$2,$3,$4,$5,$6,$7,$8,$9,'लगभग दूरी','whatsapp',$10,$11,$12) RETURNING id`,
+      [vendor.rows[0].id,pickup,drop,vehicle,trip,b.dutyDate||null,b.dutyTime||null,payout,String(inbox.rows[0].message_text).slice(0,1000),inbox.rows[0].group_name,inbox.rows[0].sender_name,inbox.rows[0].sender_phone]);
+    await client.query("UPDATE admin_whatsapp_duties SET status='published',duty_id=$2,reviewed_at=now() WHERE id=$1",[id,duty.rows[0].id]);
+    await client.query("INSERT INTO audit_log(action,subject_type,subject_id,details) VALUES('whatsapp_duty_published','duty',$1,$2)",
+      [String(duty.rows[0].id),JSON.stringify({inboxId:id,admin:req.admin?.username||"admin"})]);
+    client.release();
+    broadcastDutyUpdate();
+    res.status(201).json({ok:true,dutyId:duty.rows[0].id});
+  } catch(e) { try{client.release();}catch(_){} next(e); }
 });
 
 // Distance is only accepted from a trusted routing backend in a future integration.
