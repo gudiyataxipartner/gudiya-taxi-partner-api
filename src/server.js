@@ -402,7 +402,24 @@ async function hasActiveMembership(userId) {
       LIMIT 1`,
     [userId]
   );
-  return subscription.rowCount > 0;
+  if (subscription.rowCount > 0) return true;
+
+  // Safety fallback: an explicitly Admin-approved UPI request is authoritative
+  // even if an older deployment missed creating its matching subscription row.
+  // Its approved plan remains valid only for the plan duration from review time.
+  const approvedPayment = await pool.query(
+    `SELECT 1
+       FROM membership_payment_requests
+      WHERE user_id=$1
+        AND lower(trim(status))='approved'
+        AND reviewed_at IS NOT NULL
+        AND plan_months > 0
+        AND reviewed_at + (plan_months::text || ' months')::interval > now()
+      ORDER BY reviewed_at DESC
+      LIMIT 1`,
+    [userId]
+  );
+  return approvedPayment.rowCount > 0;
 }
 
 async function qualifyReferralIfEligible(client, userId) {
