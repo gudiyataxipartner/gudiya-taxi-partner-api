@@ -1243,7 +1243,7 @@ app.get("/api/duties", requireAuth, async (req, res, next) => {
       to_char(d.created_at AT TIME ZONE 'Asia/Kolkata', 'DD/MM/YYYY HH12:MI AM') AS created_at_ist,
       GREATEST(0, CEIL(300 - EXTRACT(EPOCH FROM (now() - d.created_at))))::int AS free_window_seconds_remaining,
       d.status,d.source_type,
-      (d.user_id=$3) AS is_owner, (d.accepted_by_user_id=$3) AS accepted_by_me, CASE WHEN d.source_type='whatsapp' THEN COALESCE(cleanWhatsAppPosterName(d.source_poster_name), u.name) ELSE u.name END AS poster_name, CASE WHEN d.source_type='whatsapp' THEN d.source_poster_phone ELSE u.phone END AS poster_phone, d.source_group AS source_group, d.source_poster_name AS source_poster_name, d.is_featured, u.driver_verification, u.vendor_verification
+      (d.user_id=$3) AS is_owner, (d.accepted_by_user_id=$3) AS accepted_by_me, CASE WHEN d.source_type='whatsapp' THEN d.source_poster_name ELSE u.name END AS poster_name, CASE WHEN d.source_type='whatsapp' THEN d.source_poster_phone ELSE u.phone END AS poster_phone, d.source_group AS source_group, d.source_poster_name AS source_poster_name, d.is_featured, u.driver_verification, u.vendor_verification
       FROM duties d JOIN users u ON u.id=d.user_id WHERE d.status='open' AND ($1='' OR d.pickup_city ILIKE '%'||$1||'%')
       AND ($2='' OR d.drop_city ILIKE '%'||$2||'%')
       AND ($4='' OR d.duty_date::text=$4)
@@ -1262,7 +1262,7 @@ app.get("/api/duties", requireAuth, async (req, res, next) => {
       // The person who posted a duty always sees its full details, regardless of membership.
       // Other subscribers see full details immediately; other non-subscribers unlock them after five minutes.
       // Compare IDs as strings too, so the duty poster is never locked by a boolean/type mismatch.
-      const isOwner = d.is_owner === true || (String(d.user_id) === String(req.auth.user_id) && d.source_type !== "whatsapp");
+      const isOwner = d.is_owner === true || String(d.user_id) === String(req.auth.user_id);
       const isImporter = d.source_type === "whatsapp" && String(d.user_id) === String(req.auth.user_id);
       const detailsAvailable = isOwner || isImporter || active || secondsRemaining === 0;
       const basic = {
@@ -1276,7 +1276,7 @@ app.get("/api/duties", requireAuth, async (req, res, next) => {
       if (detailsAvailable)
         return {
           ...basic,
-          posterName: d.poster_name,
+          posterName: d.source_type === "whatsapp" ? (cleanWhatsAppPosterName(d.poster_name) || d.poster_name || "WhatsApp ड्यूटी") : d.poster_name,
           // WhatsApp group posts often include the contact number in their text.
           // Fall back to that explicitly posted number when sender metadata is absent.
           posterPhone: d.poster_phone || (d.source_type === "whatsapp" ? extractIndianMobile(d.notes_private) : null),
