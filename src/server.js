@@ -501,6 +501,16 @@ function extractIndianMobile(value) {
   return null;
 }
 
+function cleanWhatsAppPosterName(value) {
+  const raw = String(value || "").trim();
+  if (!raw) return null;
+  const match = raw.match(/\(\d+\s+messages?\)\s*:\s*~?\s*(.+)$/i);
+  if (match && match[1].trim()) return match[1].trim();
+  const tilde = raw.lastIndexOf("~");
+  if (tilde >= 0 && raw.slice(tilde + 1).trim()) return raw.slice(tilde + 1).trim();
+  return raw;
+}
+
 function privateDuty(d) {
   return {
     id: d.id,
@@ -1233,7 +1243,7 @@ app.get("/api/duties", requireAuth, async (req, res, next) => {
       to_char(d.created_at AT TIME ZONE 'Asia/Kolkata', 'DD/MM/YYYY HH12:MI AM') AS created_at_ist,
       GREATEST(0, CEIL(300 - EXTRACT(EPOCH FROM (now() - d.created_at))))::int AS free_window_seconds_remaining,
       d.status,d.source_type,
-      (d.user_id=$3 AND d.source_type IS DISTINCT FROM 'whatsapp') AS is_owner, (d.accepted_by_user_id=$3) AS accepted_by_me, CASE WHEN d.source_type='whatsapp' THEN d.source_poster_name ELSE u.name END AS poster_name, CASE WHEN d.source_type='whatsapp' THEN d.source_poster_phone ELSE u.phone END AS poster_phone, d.source_group AS source_group, d.source_poster_name AS source_poster_name, d.is_featured, u.driver_verification, u.vendor_verification
+      (d.user_id=$3) AS is_owner, (d.accepted_by_user_id=$3) AS accepted_by_me, CASE WHEN d.source_type='whatsapp' THEN COALESCE(cleanWhatsAppPosterName(d.source_poster_name), u.name) ELSE u.name END AS poster_name, CASE WHEN d.source_type='whatsapp' THEN d.source_poster_phone ELSE u.phone END AS poster_phone, d.source_group AS source_group, d.source_poster_name AS source_poster_name, d.is_featured, u.driver_verification, u.vendor_verification
       FROM duties d JOIN users u ON u.id=d.user_id WHERE d.status='open' AND ($1='' OR d.pickup_city ILIKE '%'||$1||'%')
       AND ($2='' OR d.drop_city ILIKE '%'||$2||'%')
       AND ($4='' OR d.duty_date::text=$4)
