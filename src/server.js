@@ -528,13 +528,18 @@ function extractIndianMobile(value) {
 }
 
 function cleanWhatsAppPosterName(value) {
-  const raw = String(value || "").trim();
-  if (!raw) return null;
-  const match = raw.match(/\(\d+\s+messages?\)\s*:\s*~?\s*(.+)$/i);
-  if (match && match[1].trim()) return match[1].trim();
-  const tilde = raw.lastIndexOf("~");
-  if (tilde >= 0 && raw.slice(tilde + 1).trim()) return raw.slice(tilde + 1).trim();
-  return raw;
+  let name = String(value || "").trim();
+  if (!name) return null;
+  const groupHeader = name.match(/\(\s*\d+\s+messages?\s*\)\s*:\s*~?\s*(.+)$/i);
+  if (groupHeader && groupHeader[1].trim()) {
+    name = groupHeader[1].trim();
+  } else {
+    const tilde = name.lastIndexOf("~");
+    if (tilde >= 0 && name.slice(tilde + 1).trim()) name = name.slice(tilde + 1).trim();
+  }
+  name = name.replace(/^[\s"'“”‘’]+|[\s"'“”‘’]+$/g, "").trim();
+  name = name.replace(/\s*[·|,]?\s*(?:\+?91[\s-]?)?[6-9]\d{9}\s*$/, "").trim();
+  return name || null;
 }
 
 function privateDuty(d) {
@@ -1321,6 +1326,7 @@ app.get("/api/duties", requireAuth, async (req, res, next) => {
         freeWindowSecondsRemaining: isOwner || isImporter || active ? null : secondsRemaining,
         membershipRequiredAfterFreeWindow:
           !isOwner && !isImporter && !active && secondsRemaining === 0,
+        sourceType: d.source_type,
       };
       if (detailsAvailable)
         return {
@@ -1332,7 +1338,7 @@ app.get("/api/duties", requireAuth, async (req, res, next) => {
           pickupAddress: d.pickup_address_private,
           dropAddress: d.drop_address_private,
           payoutRupees: d.payout_paise == null ? null : d.payout_paise / 100,
-          notes: d.notes_private,
+          notes: d.source_type === "whatsapp" ? null : d.notes_private,
           detailsAvailable: true,
         };
       return basic;
@@ -1592,7 +1598,7 @@ app.get("/api/duties/accepted", requireAuth, async (req, res, next) => {
     await ensureWhatsAppDutySchema();
     const r = await pool.query(
       `SELECT d.id,d.user_id,d.role_posted_as,d.pickup_city,d.pickup_address_private,d.drop_city,d.drop_address_private,
-      d.vehicle_type,d.trip_type,d.duty_date,d.duty_time,d.payout_paise,d.notes_private,d.distance_km,d.distance_label,d.created_at,d.status,
+      d.vehicle_type,d.trip_type,d.duty_date,d.duty_time,d.payout_paise,d.notes_private,d.distance_km,d.distance_label,d.created_at,d.status,d.source_type,
       (d.user_id=$1) AS is_owner, (d.accepted_by_user_id=$1) AS accepted_by_me, CASE WHEN d.source_type='whatsapp' THEN d.source_poster_name ELSE u.name END AS poster_name, CASE WHEN d.source_type='whatsapp' THEN d.source_poster_phone ELSE u.phone END AS poster_phone, d.source_group AS source_group, d.source_poster_name AS source_poster_name
       FROM duties d JOIN users u ON u.id=d.user_id WHERE d.accepted_by_user_id=$1 ORDER BY d.is_featured DESC, d.created_at DESC LIMIT 100`,
       [req.auth.user_id]
@@ -1600,15 +1606,14 @@ app.get("/api/duties/accepted", requireAuth, async (req, res, next) => {
     res.json({
       duties: r.rows.map((d) => ({
         ...privateDuty(d),
-        posterName: d.poster_name,
-        posterPhone: d.poster_phone,
-        sourcePosterName: d.source_poster_name,
-        sourceGroup: d.source_group,
+        posterName: d.source_type === "whatsapp" ? (cleanWhatsAppPosterName(d.source_poster_name) || "WhatsApp ड्यूटी") : d.poster_name,
+        posterPhone: d.source_type === "whatsapp" ? (d.poster_phone || extractIndianMobile(d.notes_private)) : d.poster_phone,
+        sourcePosterName: d.source_type === "whatsapp" ? cleanWhatsAppPosterName(d.source_poster_name) : d.source_poster_name,
         sourceType: d.source_type,
         pickupAddress: d.pickup_address_private,
         dropAddress: d.drop_address_private,
         payoutRupees: d.payout_paise == null ? null : d.payout_paise / 100,
-        notes: d.notes_private,
+        notes: d.source_type === "whatsapp" ? null : d.notes_private,
         detailsAvailable: true,
       })),
     });
@@ -1639,6 +1644,35 @@ app.get("/api/duties/mine", requireAuth, async (req, res, next) => {
         dropAddress: d.drop_address_private,
         payoutRupees: d.payout_paise == null ? null : d.payout_paise / 100,
         notes: d.notes_private,
+        detailsAvailable: true,
+      })),
+    });
+  } catch (e) {
+    next(e);
+  }
+});
+
+app.get("/api/duties/mine", requireAuth, async (req, res, next) => {
+  try {
+    await ensureWhatsAppDutySchema();
+    const r = await pool.query(
+      `SELECT id,role_posted_as,pickup_city,pickup_address_private,drop_city,drop_address_private,vehicle_type,trip_type,duty_date,duty_time,payout_paise,notes_private,distance_km,distance_label,created_at,status,source_type,source_group,source_poster_name,source_poster_phone,
+      (user_id=$1) AS is_owner
+      FROM duties WHERE user_id=$1 ORDER BY created_at DESC LIMIT 100`,
+      [req.auth.user_id]
+    );
+    res.json({
+      duties: r.rows.map((d) => ({
+        ...privateDuty(d),
+        rolePostedAs: d.role_posted_as,
+        posterName: d.source_type === "whatsapp" ? (cleanWhatsAppPosterName(d.source_poster_name) || "WhatsApp ड्यूटी") : req.auth.name,
+        posterPhone: d.source_type === "whatsapp" ? (d.source_poster_phone || extractIndianMobile(d.notes_private)) : req.auth.phone,
+        sourcePosterName: d.source_type === "whatsapp" ? cleanWhatsAppPosterName(d.source_poster_name) : null,
+        sourceType: d.source_type,
+        pickupAddress: d.pickup_address_private,
+        dropAddress: d.drop_address_private,
+        payoutRupees: d.payout_paise == null ? null : d.payout_paise / 100,
+        notes: d.source_type === "whatsapp" ? null : d.notes_private,
         detailsAvailable: true,
       })),
     });
