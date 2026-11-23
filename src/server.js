@@ -70,69 +70,95 @@ async function ensureWhatsAppDutySchema() {
   return whatsappDutySchemaPromise;
 }
 // Firebase Admin credentials must be stored as a Render secret, never committed to GitHub.
-// Set FIREBASE_SERVICE_ACCOUNT_JSON to the complete service-account JSON string.
+// FIREBASE_SERVICE_ACCOUNT_JSON accepts the complete service-account JSON string.
+// FIREBASE_SERVICE_ACCOUNT_BASE64 is an optional fallback for multiline-secret formatting.
 let firebaseMessaging = null;
+let firebasePushSetupError = "FIREBASE_SERVICE_ACCOUNT_JSON is missing";
 try {
-  if (process.env.FIREBASE_SERVICE_ACCOUNT_JSON) {
-    const serviceAccount = JSON.parse(
-      process.env.FIREBASE_SERVICE_ACCOUNT_JSON
-    );
+  const rawServiceAccount = String(
+    process.env.FIREBASE_SERVICE_ACCOUNT_JSON ||
+      (process.env.FIREBASE_SERVICE_ACCOUNT_BASE64
+        ? Buffer.from(process.env.FIREBASE_SERVICE_ACCOUNT_BASE64, "base64").toString("utf8")
+        : "")
+  ).trim();
+  if (rawServiceAccount) {
+    const serviceAccount = JSON.parse(rawServiceAccount);
+    if (!serviceAccount.project_id || !serviceAccount.client_email || !serviceAccount.private_key) {
+      throw new Error("Service-account JSON is missing project_id, client_email or private_key");
+    }
+    serviceAccount.private_key = String(serviceAccount.private_key).replace(/\\n/g, "\n");
     if (!firebaseAdmin.apps.length) {
       firebaseAdmin.initializeApp({
         credential: firebaseAdmin.credential.cert(serviceAccount),
+        projectId: serviceAccount.project_id,
       });
     }
     firebaseMessaging = firebaseAdmin.messaging();
+    firebasePushSetupError = "";
+    console.log("Firebase Admin initialized for project:", serviceAccount.project_id);
+  } else {
+    console.error("PUSH NOTIFICATIONS DISABLED:", firebasePushSetupError);
   }
 } catch (error) {
-  console.error(
-    "Firebase Admin is not configured; push notifications are disabled:",
-    error.message
-  );
+  firebasePushSetupError = error.message || "Firebase Admin initialization failed";
+  console.error("PUSH NOTIFICATIONS DISABLED:", firebasePushSetupError);
 }
 
 async function sendPushToUserIds(userIds, title, body, extraData = {}) {
-  if (!firebaseMessaging || !Array.isArray(userIds) || !userIds.length) return;
+  if (!Array.isArray(userIds) || !userIds.length) return;
+  if (!firebaseMessaging) {
+    console.warn("Push skipped: Firebase Admin is not configured.", firebasePushSetupError);
+    return;
+  }
   try {
-    const ids = [...new Set(userIds.map(String))];
+    const ids = [...new Set(userIds.map(String).filter((id) => /^\d+$/.test(id)))];
+    if (!ids.length) return;
     const found = await pool.query(
       "SELECT token FROM push_tokens WHERE user_id = ANY($1::bigint[])",
       [ids]
     );
     const tokens = found.rows.map((row) => row.token).filter(Boolean);
+    if (!tokens.length) {
+      console.warn("Push skipped: no registered FCM tokens for recipient count:", ids.length);
+      return;
+    }
     for (let i = 0; i < tokens.length; i += 500) {
       const batch = tokens.slice(i, i + 500);
       const data = Object.fromEntries(
-        Object.entries({
-          title,
-          body,
-          ...extraData,
-        }).map(([key, value]) => [key, String(value ?? "")])
+        Object.entries({ title, body, ...extraData }).map(([key, value]) => [key, String(value ?? "")])
       );
       const result = await firebaseMessaging.sendEachForMulticast({
-        tokens: batch,
+        // Notification payload lets Android display it while the app is in the background.
+        // Data is retained for app-side handling while the app is in the foreground.
+        notification: { title: String(title), body: String(body) },
         data,
-        android: { priority: "high" },
+        android: {
+          priority: "high",
+          notification: {
+            channelId: "gudiya_updates",
+            sound: "default",
+          },
+        },
       });
       const invalid = [];
       result.responses.forEach((response, index) => {
-        if (
-          !response.success &&
-          [
+        if (!response.success) {
+          console.error("FCM send failed for one token:", response.error?.code || response.error?.message || "unknown error");
+          if ([
             "messaging/registration-token-not-registered",
             "messaging/invalid-registration-token",
-          ].includes(response.error?.code)
-        )
-          invalid.push(batch[index]);
+          ].includes(response.error?.code)) {
+            invalid.push(batch[index]);
+          }
+        }
       });
-      if (invalid.length)
-        await pool.query(
-          "DELETE FROM push_tokens WHERE token = ANY($1::text[])",
-          [invalid]
-        );
+      console.log("FCM batch completed: " + result.successCount + " sent, " + result.failureCount + " failed.");
+      if (invalid.length) {
+        await pool.query("DELETE FROM push_tokens WHERE token = ANY($1::text[])", [invalid]);
+      }
     }
   } catch (error) {
-    console.error("Push notification send failed:", error.message);
+    console.error("Push notification send failed:", error.stack || error.message);
   }
 }
 
@@ -737,6 +763,29 @@ app.post("/api/push/register-token", requireAuth, async (req, res, next) => {
       [token, req.auth.user_id]
     );
     return res.json({ ok: true, registered: true });
+  } catch (e) {
+    next(e);
+  }
+});
+
+app.get("/api/push/status", requireAuth, async (req, res, next) => {
+  try {
+    const result = await pool.query(
+      "SELECT count(*)::int AS token_count FROM push_tokens WHERE user_id=$1",
+      [req.auth.user_id]
+    );
+    const tokenCount = Number(result.rows[0]?.token_count || 0);
+    const registered = tokenCount > 0;
+    return res.json({
+      enabled: Boolean(firebaseMessaging),
+      registered,
+      tokenCount,
+      message: !firebaseMessaging
+        ? "Backend पर Firebase Admin configuration उपलब्ध नहीं है।"
+        : !registered
+          ? "इस अकाउंट का FCM token रजिस्टर नहीं है। ऐप दोबारा खोलकर लॉगिन करें।"
+          : "Push notification configuration तैयार है।",
+    });
   } catch (e) {
     next(e);
   }
