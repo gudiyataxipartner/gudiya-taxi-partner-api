@@ -1635,36 +1635,6 @@ app.get("/api/duties/mine", requireAuth, async (req, res, next) => {
       duties: r.rows.map((d) => ({
         ...privateDuty(d),
         rolePostedAs: d.role_posted_as,
-        posterName: d.source_type === 'whatsapp' ? d.source_poster_name : req.auth.name,
-        posterPhone: d.source_type === 'whatsapp' ? d.source_poster_phone : req.auth.phone,
-        sourcePosterName: d.source_poster_name,
-        sourceGroup: d.source_group,
-        sourceType: d.source_type,
-        pickupAddress: d.pickup_address_private,
-        dropAddress: d.drop_address_private,
-        payoutRupees: d.payout_paise == null ? null : d.payout_paise / 100,
-        notes: d.notes_private,
-        detailsAvailable: true,
-      })),
-    });
-  } catch (e) {
-    next(e);
-  }
-});
-
-app.get("/api/duties/mine", requireAuth, async (req, res, next) => {
-  try {
-    await ensureWhatsAppDutySchema();
-    const r = await pool.query(
-      `SELECT id,role_posted_as,pickup_city,pickup_address_private,drop_city,drop_address_private,vehicle_type,trip_type,duty_date,duty_time,payout_paise,notes_private,distance_km,distance_label,created_at,status,source_type,source_group,source_poster_name,source_poster_phone,
-      (user_id=$1) AS is_owner
-      FROM duties WHERE user_id=$1 ORDER BY created_at DESC LIMIT 100`,
-      [req.auth.user_id]
-    );
-    res.json({
-      duties: r.rows.map((d) => ({
-        ...privateDuty(d),
-        rolePostedAs: d.role_posted_as,
         posterName: d.source_type === "whatsapp" ? (cleanWhatsAppPosterName(d.source_poster_name) || "WhatsApp ड्यूटी") : req.auth.name,
         posterPhone: d.source_type === "whatsapp" ? (d.source_poster_phone || extractIndianMobile(d.notes_private)) : req.auth.phone,
         sourcePosterName: d.source_type === "whatsapp" ? cleanWhatsAppPosterName(d.source_poster_name) : null,
