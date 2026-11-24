@@ -1218,18 +1218,21 @@ app.post("/api/admin/whatsapp-duties/:id/publish", requireAdmin, async(req,res,n
     const pickup = String(b.pickupCity || b.pickup || "").trim().slice(0,120);
     const drop = String(b.dropCity || b.drop || "").trim().slice(0,120);
     const vehicle = String(b.vehicleType || b.vehicle || "").trim().slice(0,80);
-    const trip = String(b.tripType || "one_way");
+    const trip = String(b.tripType || "").trim();
     const dutyTime = String(b.dutyTime || "").trim();
-    const dutyDate = String(b.dutyDate || "").trim() || null;
+    const dutyDate = String(b.dutyDate || "").trim();
     if (!pickup || !drop || !vehicle || !["one_way","round_trip","local_booking"].includes(trip))
-      return res.status(400).json({error:"Pickup, drop, vehicle and valid trip type are required"});
-    if (dutyDate && !/^20\d{2}-\d{2}-\d{2}$/.test(dutyDate))
-      return res.status(400).json({error:"Invalid duty date"});
-    if (dutyTime && !/^([01]\d|2[0-3]):[0-5]\d(?::[0-5]\d)?$/.test(dutyTime))
-      return res.status(400).json({error:"Invalid duty time"});
+      return res.status(400).json({error:"Pickup, drop, vehicle and an explicitly selected trip type are required"});
+    if (!/^20\\d{2}-\\d{2}-\\d{2}$/.test(dutyDate))
+      return res.status(400).json({error:"Duty date is required"});
+    const dateCheck = new Date(dutyDate + "T00:00:00.000Z");
+    if (Number.isNaN(dateCheck.getTime()) || dateCheck.toISOString().slice(0,10) !== dutyDate)
+      return res.status(400).json({error:"Duty date is not a valid calendar date"});
+    if (!/^([01]\\d|2[0-3]):[0-5]\\d(?::[0-5]\\d)?$/.test(dutyTime))
+      return res.status(400).json({error:"Duty time is required in 24-hour format"});
     const payout = b.payoutRupees == null || b.payoutRupees === "" ? null : Math.round(Number(b.payoutRupees) * 100);
-    if (payout !== null && (!Number.isFinite(payout) || payout < 0 || payout > 100000000))
-      return res.status(400).json({error:"Invalid payout"});
+    if (payout === null || !Number.isFinite(payout) || payout <= 0 || payout > 100000000)
+      return res.status(400).json({error:"A valid driver payment greater than zero is required"});
     const vendorPhone = String(process.env.WHATSAPP_VENDOR_PHONE || "").replace(/\D/g,"").slice(-10);
     if (!/^[6-9]\d{9}$/.test(vendorPhone))
       return res.status(503).json({error:"WHATSAPP_VENDOR_PHONE is not configured as a valid Indian mobile number"});
