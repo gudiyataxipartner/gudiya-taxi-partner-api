@@ -1,0 +1,31 @@
+name: Verify Available Vehicle Routes
+
+on:
+  push:
+    branches: [main]
+    paths:
+      - ".github/workflows/verify-available-vehicle-routes.yml"
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  verify:
+    runs-on: ubuntu-latest
+    timeout-minutes: 3
+    steps:
+      - name: Verify routes exist behind authentication
+        shell: bash
+        run: |
+          set -euo pipefail
+          BASE="https://gudiya-taxi-partner-api-1.onrender.com"
+          for route in "/api/vehicles/available" "/api/vehicles/available/mine"; do
+            status="$(curl --silent --show-error --max-time 20 -o /tmp/response.txt -w '%{http_code}' "$BASE$route")"
+            echo "$route => HTTP $status"
+            if [[ "$status" != "401" && "$status" != "403" ]]; then
+              cat /tmp/response.txt
+              exit 1
+            fi
+          done
+          echo "Both Available Vehicles routes are registered and require authentication."
