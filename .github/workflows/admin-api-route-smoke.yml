@@ -45,7 +45,7 @@ jobs:
                 break;
               } catch (_) {}
             }
-            const tokenizer = acorn.tokenizer(source, { ecmaVersion: 'latest', sourceType: 'script' });
+            const tokenizer = acorn.tokenizer(source, { ecmaVersion: 'latest', sourceType: 'script', locations: true });
             const stack = [];
             const close = { '}':'{', ')':'(', ']':'[' };
             while (true) {
