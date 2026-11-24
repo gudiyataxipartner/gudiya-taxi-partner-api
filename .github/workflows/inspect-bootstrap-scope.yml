@@ -46,4 +46,23 @@ jobs:
             }
           }
           walk(ast);
+          function findHiddenCode(node) {
+            if(node.type==='TemplateLiteral') {
+              const raw=node.quasis.map(q=>q.value.raw).join('');
+              if(raw.includes('function csvCell')||raw.includes('initializeDatabase')||raw.includes('app.get("/api/admin/notifications"')) {
+                console.log('TEMPLATE HIDES SERVER SOURCE from '+node.loc.start.line+':'+node.loc.start.column+' to '+node.loc.end.line+':'+node.loc.end.column);
+                console.log(raw.slice(Math.max(0,raw.indexOf('function csvCell')-300),raw.indexOf('function csvCell')+700));
+              }
+            }
+            if(node.type==='Literal'&&typeof node.value==='string'&&(node.value.includes('function csvCell')||node.value.includes('initializeDatabase'))) {
+              console.log('STRING HIDES SERVER SOURCE at '+node.loc.start.line+':'+node.loc.start.column+' '+node.value.slice(0,300));
+            }
+            for(const [key,value] of Object.entries(node)) {
+              if(key==='loc'||key==='start'||key==='end')continue;
+              if(Array.isArray(value)) {
+                for(const child of value)if(child&&typeof child.type==='string')findHiddenCode(child);
+              } else if(value&&typeof value.type==='string')findHiddenCode(value);
+            }
+          }
+          findHiddenCode(ast);
           JS
