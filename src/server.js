@@ -1417,6 +1417,117 @@ app.post("/api/duties/:id/favorite",requireAuth,async(req,res,next)=>{try{if(!/^
 app.delete("/api/duties/:id/favorite",requireAuth,async(req,res,next)=>{try{if(!/^\d+$/.test(String(req.params.id)))return res.status(400).json({error:"Invalid duty ID"});await pool.query("DELETE FROM user_favorite_duties WHERE user_id=$1 AND duty_id=$2",[req.auth.user_id,req.params.id]);res.json({ok:true,saved:false});}catch(e){next(e);}});
 app.post("/api/duties/:id/report",requireAuth,async(req,res,next)=>{try{if(!/^\d+$/.test(String(req.params.id)))return res.status(400).json({error:"Invalid duty ID"});const reason=String(req.body.reason||"").trim().slice(0,80),details=String(req.body.details||"").trim().slice(0,1000);if(!["fake_duty","wrong_contact","misleading_details","spam","other"].includes(reason))return res.status(400).json({error:"शिकायत का कारण चुनें।"});const d=await pool.query("SELECT user_id FROM duties WHERE id=$1",[req.params.id]);if(!d.rowCount)return res.status(404).json({error:"Duty not found"});if(String(d.rows[0].user_id)===String(req.auth.user_id))return res.status(400).json({error:"आप अपनी ही ड्यूटी रिपोर्ट नहीं कर सकते।"});const r=await pool.query(`INSERT INTO duty_reports(duty_id,reporter_user_id,reason,details) VALUES($1,$2,$3,$4) ON CONFLICT(duty_id,reporter_user_id) DO UPDATE SET reason=EXCLUDED.reason,details=EXCLUDED.details,status='pending',created_at=now() RETURNING id,status`,[req.params.id,req.auth.user_id,reason,details]);res.status(201).json({ok:true,report:r.rows[0]});}catch(e){next(e);}});
 
+// Available Vehicles marketplace. Users can post, view and manage vehicles that are free.
+app.get("/api/vehicles/available", requireAuth, async (req, res, next) => {
+  try {
+    const city = String(req.query.city || "").trim().slice(0, 120);
+    const result = await pool.query(
+      "SELECT v.id,v.user_id,v.vehicle_type,v.vehicle_model,v.registration_number," +
+      "v.city,v.seats,v.available_from,v.available_until,v.notes,v.created_at," +
+      "u.name AS owner_name,u.phone AS owner_phone,(v.user_id=$2) AS is_owner " +
+      "FROM available_vehicles v JOIN users u ON u.id=v.user_id " +
+      "WHERE v.status='available' AND v.available_from <= now() " +
+      "AND (v.available_until IS NULL OR v.available_until > now()) " +
+      "AND ($1='' OR v.city ILIKE '%' || $1 || '%') " +
+      "ORDER BY v.created_at DESC LIMIT 200",
+      [city, req.auth.user_id]
+    );
+    return res.json({ vehicles: result.rows });
+  } catch (error) {
+    next(error);
+  }
+});
+
+app.get("/api/vehicles/available/mine", requireAuth, async (req, res, next) => {
+  try {
+    const result = await pool.query(
+      "SELECT id,vehicle_type,vehicle_model,registration_number,city,seats," +
+      "available_from,available_until,notes,status,created_at,updated_at " +
+      "FROM available_vehicles WHERE user_id=$1 ORDER BY created_at DESC LIMIT 100",
+      [req.auth.user_id]
+    );
+    return res.json({ vehicles: result.rows });
+  } catch (error) {
+    next(error);
+  }
+});
+
+app.post("/api/vehicles/available", requireAuth, async (req, res, next) => {
+  try {
+    const vehicleType = String(req.body.vehicleType || "").trim().slice(0, 80);
+    const vehicleModel = String(req.body.vehicleModel || "").trim().slice(0, 120);
+    const registrationNumber = String(req.body.registrationNumber || "")
+      .trim().toUpperCase().replace(/\s+/g, " ").slice(0, 24);
+    const city = String(req.body.city || "").trim().slice(0, 120);
+    const seats = req.body.seats == null || req.body.seats === "" ? 4 : Number(req.body.seats);
+    const notes = String(req.body.notes || "").trim().slice(0, 800);
+    const availableFrom = req.body.availableFrom ? new Date(req.body.availableFrom) : new Date();
+    const availableUntil = req.body.availableUntil ? new Date(req.body.availableUntil) : null;
+
+    if (!vehicleType || !city) {
+      return res.status(400).json({ error: "गाड़ी का प्रकार और शहर जरूरी हैं।" });
+    }
+    if (!Number.isInteger(seats) || seats < 1 || seats > 50) {
+      return res.status(400).json({ error: "सीटों की संख्या 1 से 50 के बीच लिखें।" });
+    }
+    if (Number.isNaN(availableFrom.getTime()) ||
+        (availableUntil && Number.isNaN(availableUntil.getTime()))) {
+      return res.status(400).json({ error: "उपलब्धता की तारीख और समय सही नहीं है।" });
+    }
+    if (availableUntil && availableUntil <= availableFrom) {
+      return res.status(400).json({ error: "उपलब्धता समाप्ति का समय, शुरू होने के समय के बाद होना चाहिए।" });
+    }
+
+    const result = await pool.query(
+      "INSERT INTO available_vehicles(user_id,vehicle_type,vehicle_model,registration_number," +
+      "city,seats,available_from,available_until,notes,status) " +
+      "VALUES($1,$2,$3,$4,$5,$6,$7,$8,$9,'available') " +
+      "RETURNING id,vehicle_type,vehicle_model,registration_number,city,seats," +
+      "available_from,available_until,notes,status,created_at",
+      [req.auth.user_id,vehicleType,vehicleModel,registrationNumber,city,seats,
+       availableFrom.toISOString(),availableUntil ? availableUntil.toISOString() : null,notes]
+    );
+    return res.status(201).json({ vehicle: result.rows[0], message: "आपकी गाड़ी उपलब्ध गाड़ियों में पोस्ट हो गई।" });
+  } catch (error) {
+    next(error);
+  }
+});
+
+app.patch("/api/vehicles/available/:id/status", requireAuth, async (req, res, next) => {
+  try {
+    const id = String(req.params.id || "");
+    const status = String(req.body.status || "").trim().toLowerCase();
+    if (!/^\d+$/.test(id)) return res.status(400).json({ error: "गाड़ी ID सही नहीं है।" });
+    if (!["available","unavailable"].includes(status)) {
+      return res.status(400).json({ error: "गाड़ी की स्थिति सही नहीं है।" });
+    }
+    const result = await pool.query(
+      "UPDATE available_vehicles SET status=$1,updated_at=now() " +
+      "WHERE id=$2 AND user_id=$3 RETURNING id,status",
+      [status,id,req.auth.user_id]
+    );
+    if (!result.rowCount) return res.status(404).json({ error: "आपकी पोस्ट की गई गाड़ी नहीं मिली।" });
+    return res.json({ vehicle: result.rows[0], message: status === "available" ? "गाड़ी फिर से उपलब्ध कर दी गई।" : "गाड़ी को unavailable कर दिया गया।" });
+  } catch (error) {
+    next(error);
+  }
+});
+
+app.delete("/api/vehicles/available/:id", requireAuth, async (req, res, next) => {
+  try {
+    const id = String(req.params.id || "");
+    if (!/^\d+$/.test(id)) return res.status(400).json({ error: "गाड़ी ID सही नहीं है।" });
+    const result = await pool.query(
+      "DELETE FROM available_vehicles WHERE id=$1 AND user_id=$2 RETURNING id",
+      [id,req.auth.user_id]
+    );
+    if (!result.rowCount) return res.status(404).json({ error: "आपकी पोस्ट की गई गाड़ी नहीं मिली।" });
+    return res.json({ ok: true, message: "गाड़ी की पोस्ट हटा दी गई।" });
+  } catch (error) {
+    next(error);
+  }
+});
+
 app.get("/api/duties", requireAuth, async (req, res, next) => {
   try {
     await ensureWhatsAppDutySchema();
@@ -2721,4 +2832,46 @@ app.get("/api/admin/duty-reports",requireAdmin,async(req,res,next)=>{try{const s
 app.post("/api/admin/duty-reports/:id/review",requireAdmin,async(req,res,next)=>{try{if(!/^\d+$/.test(String(req.params.id)))return res.status(400).json({error:"Invalid report ID"});const status=String(req.body.status||"");if(!["reviewed","dismissed","actioned"].includes(status))return res.status(400).json({error:"Invalid report status"});const r=await pool.query("UPDATE duty_reports SET status=$1,admin_note=$2,reviewed_at=now(),reviewed_by=$3 WHERE id=$4 RETURNING id,status",[status,String(req.body.note||"").slice(0,1000),req.admin?.username||"admin",req.params.id]);if(!r.rowCount)return res.status(404).json({error:"Report not found"});res.json({ok:true,report:r.rows[0]});}catch(e){next(e);}});
 app.post("/api/admin/duties/:id/featured",requireAdmin,async(req,res,next)=>{try{if(!/^\d+$/.test(String(req.params.id)))return res.status(400).json({error:"Invalid duty ID"});const r=await pool.query("UPDATE duties SET is_featured=$1 WHERE id=$2 RETURNING id,is_featured",[req.body.featured===true,req.params.id]);if(!r.rowCount)return res.status(404).json({error:"Duty not found"});broadcastDutyUpdate();res.json({ok:true,duty:r.rows[0]});}catch(e){next(e);}});
 
-app.use((err, _req, res, _next) => { console.error(err.message); const status = Number(err.status) || 500; res .status(status) .json({ error: status < 500 ? err.message : "Server error" }); }); // Bootstrap the complete schema before accepting requests. // Serialize startup migrations across overlapping Render instances to prevent DDL deadlocks. const schemaCandidates = [ path.join(__dirname, "schema.sql"), path.join(__dirname, "..", "schema.sql"), path.join(process.cwd(), "schema.sql"), path.join(process.cwd(), "src", "schema.sql"), ]; const schemaPath = schemaCandidates.find((candidate) => fs.existsSync(candidate) ); if (!schemaPath) { throw new Error( "schema.sql not found. Checked: " + schemaCandidates.join(", ") + ". Ensure schema.sql is committed to the deployed repository root." ); } async function initializeDatabase() { const client = await pool.connect(); let transactionOpen = false; try { await client.query("BEGIN"); transactionOpen = true; // All app instances use the same transaction-scoped lock key. // A second instance waits here instead of running ALTER/CREATE concurrently. await client.query("SELECT pg_advisory_xact_lock($1)", [741029316]); console.log("Loading database schema from:", schemaPath); const schemaSql = fs.readFileSync(schemaPath, "utf8"); await client.query(schemaSql); await client.query( "ALTER TABLE duties ADD COLUMN IF NOT EXISTS trip_type TEXT NOT NULL DEFAULT 'one_way'" ); await client.query( "ALTER TABLE duties DROP CONSTRAINT IF EXISTS duties_trip_type_check" ); await client.query( "ALTER TABLE duties ADD CONSTRAINT duties_trip_type_check CHECK (trip_type IN ('one_way','round_trip','local_booking'))" ); await client.query( "ALTER TABLE users ADD COLUMN IF NOT EXISTS password_hash TEXT" ); await client.query( "ALTER TABLE users ADD COLUMN IF NOT EXISTS referral_code TEXT" ); await client.query( "ALTER TABLE users ADD COLUMN IF NOT EXISTS referred_by_user_id BIGINT REFERENCES users(id) ON DELETE SET NULL" ); await client.query( "ALTER TABLE users ADD COLUMN IF NOT EXISTS first_paid_membership_at TIMESTAMPTZ" ); await client.query( "ALTER TABLE users ADD COLUMN IF NOT EXISTS referral_qualified_at TIMESTAMPTZ" ); await client.query(` UPDATE users SET referral_code='GTP' || upper(substr(md5(id::text || random()::text),1,10)) WHERE referral_code IS NULL `); await client.query( "CREATE UNIQUE INDEX IF NOT EXISTS users_referral_code_unique ON users(referral_code)" ); await client.query(` CREATE TABLE IF NOT EXISTS referral_reward_events ( id BIGSERIAL PRIMARY KEY, referrer_user_id BIGINT NOT NULL REFERENCES users(id) ON DELETE CASCADE, milestone INTEGER NOT NULL CHECK (milestone IN (15,50)), months_awarded INTEGER NOT NULL CHECK (months_awarded IN (1,2)), subscription_id BIGINT REFERENCES subscriptions(id) ON DELETE SET NULL, created_at TIMESTAMPTZ NOT NULL DEFAULT now(), UNIQUE(referrer_user_id,milestone) ) `); await client.query( "ALTER TABLE users ADD COLUMN IF NOT EXISTS vendor_verification TEXT NOT NULL DEFAULT 'not_submitted'" ); await client.query( "ALTER TABLE driver_documents ADD COLUMN IF NOT EXISTS encrypted_payload TEXT" ); await client.query( "ALTER TABLE driver_documents DROP CONSTRAINT IF EXISTS driver_documents_document_type_check" ); await client.query( "ALTER TABLE driver_documents ADD CONSTRAINT driver_documents_document_type_check CHECK (document_type IN ('aadhaar','vendor_aadhaar','driving_licence','vehicle_rc','vendor_gst','vendor_pan'))" ); await client.query(` CREATE TABLE IF NOT EXISTS membership_payment_requests ( id BIGSERIAL PRIMARY KEY, user_id BIGINT NOT NULL REFERENCES users(id) ON DELETE CASCADE, plan_months INTEGER NOT NULL CHECK (plan_months IN (1,3,6)), amount_rupees INTEGER NOT NULL CHECK (amount_rupees IN (51,151,301)), utr VARCHAR(40) NOT NULL UNIQUE, status TEXT NOT NULL DEFAULT 'pending' CHECK (status IN ('pending','approved','rejected')), admin_note TEXT, created_at TIMESTAMPTZ NOT NULL DEFAULT now(), reviewed_at TIMESTAMPTZ, reviewed_by TEXT ) `); await client.query(` CREATE TABLE IF NOT EXISTS admin_membership_overrides ( user_id BIGINT PRIMARY KEY REFERENCES users(id) ON DELETE CASCADE, status TEXT NOT NULL CHECK (status IN ('paid','unpaid')), note TEXT NOT NULL DEFAULT '', updated_at TIMESTAMPTZ NOT NULL DEFAULT now() ) `); await client.query("CREATE TABLE IF NOT EXISTS admin_notifications (id BIGSERIAL PRIMARY KEY, title TEXT NOT NULL, body TEXT NOT NULL, kind TEXT NOT NULL DEFAULT 'info', is_read BOOLEAN NOT NULL DEFAULT false, created_at TIMESTAMPTZ NOT NULL DEFAULT now())"); await client.query("COMMIT"); transactionOpen = false; databaseReady = true; console.log("Database schema initialized successfully. databaseReady=true"); } catch (error) { if (transactionOpen) { try { await client.query("ROLLBACK"); } catch (_) {} } throw error; } finally { client.release(); } } async function startServerWithDatabaseRetry() { // HTTP listener is already active; initialize the database in the background. databaseReady = false; let attempt = 0; while (true) { attempt += 1; try { console.log(`Starting database initialization attempt ${attempt}...`); await initializeDatabase(); console.log("Database initialization completed. API is ready."); return; } catch (error) { console.error( `Database initialization attempt ${attempt} failed:`, JSON.stringify({ code: error.code || "NO_CODE", message: error.message || String(error), detail: error.detail || null, hint: error.hint || null, table: error.table || null, constraint: error.constraint || null, stack: error.stack || null, }) ); const waitMs = Math.min(attempt * 5000, 30000); console.warn( `Database initialization will retry in ${waitMs / 1000} seconds.` ); await new Promise((resolve) => setTimeout(resolve, waitMs)); } } } startServerWithDatabaseRetry();
+app.use((err, _req, res, _next) => { console.error(err.message); const status = Number(err.status) || 500; res .status(status) .json({ error: status < 500 ? err.message : "Server error" }); }); // Bootstrap the complete schema before accepting requests. // Serialize startup migrations across overlapping Render instances to prevent DDL deadlocks. const schemaCandidates = [ path.join(__dirname, "schema.sql"), path.join(__dirname, "..", "schema.sql"), path.join(process.cwd(), "schema.sql"), path.join(process.cwd(), "src", "schema.sql"), ]; const schemaPath = schemaCandidates.find((candidate) => fs.existsSync(candidate) ); if (!schemaPath) { throw new Error( "schema.sql not found. Checked: " + schemaCandidates.join(", ") + ". Ensure schema.sql is committed to the deployed repository root." ); } async function initializeDatabase() { const client = await pool.connect(); let transactionOpen = false; try { await client.query("BEGIN"); transactionOpen = true; // All app instances use the same transaction-scoped lock key. // A second instance waits here instead of running ALTER/CREATE concurrently. await client.query("SELECT pg_advisory_xact_lock($1)", [741029316]); console.log("Loading database schema from:", schemaPath); const schemaSql = fs.readFileSync(schemaPath, "utf8"); await client.query(schemaSql); await client.query( "ALTER TABLE duties ADD COLUMN IF NOT EXISTS trip_type TEXT NOT NULL DEFAULT 'one_way'" ); await client.query( "ALTER TABLE duties DROP CONSTRAINT IF EXISTS duties_trip_type_check" ); await client.query( "ALTER TABLE duties ADD CONSTRAINT duties_trip_type_check CHECK (trip_type IN ('one_way','round_trip','local_booking'))" ); await client.query( "ALTER TABLE users ADD COLUMN IF NOT EXISTS password_hash TEXT" ); await client.query( "ALTER TABLE users ADD COLUMN IF NOT EXISTS referral_code TEXT" ); await client.query( "ALTER TABLE users ADD COLUMN IF NOT EXISTS referred_by_user_id BIGINT REFERENCES users(id) ON DELETE SET NULL" ); await client.query( "ALTER TABLE users ADD COLUMN IF NOT EXISTS first_paid_membership_at TIMESTAMPTZ" ); await client.query( "ALTER TABLE users ADD COLUMN IF NOT EXISTS referral_qualified_at TIMESTAMPTZ" ); await client.query(` UPDATE users SET referral_code='GTP' || upper(substr(md5(id::text || random()::text),1,10)) WHERE referral_code IS NULL `); await client.query( "CREATE UNIQUE INDEX IF NOT EXISTS users_referral_code_unique ON users(referral_code)" ); await client.query(` CREATE TABLE IF NOT EXISTS referral_reward_events ( id BIGSERIAL PRIMARY KEY, referrer_user_id BIGINT NOT NULL REFERENCES users(id) ON DELETE CASCADE, milestone INTEGER NOT NULL CHECK (milestone IN (15,50)), months_awarded INTEGER NOT NULL CHECK (months_awarded IN (1,2)), subscription_id BIGINT REFERENCES subscriptions(id) ON DELETE SET NULL, created_at TIMESTAMPTZ NOT NULL DEFAULT now(), UNIQUE(referrer_user_id,milestone) ) `); await client.query( "ALTER TABLE users ADD COLUMN IF NOT EXISTS vendor_verification TEXT NOT NULL DEFAULT 'not_submitted'" ); await client.query( "ALTER TABLE driver_documents ADD COLUMN IF NOT EXISTS encrypted_payload TEXT" ); await client.query( "ALTER TABLE driver_documents DROP CONSTRAINT IF EXISTS driver_documents_document_type_check" ); await client.query( "ALTER TABLE driver_documents ADD CONSTRAINT driver_documents_document_type_check CHECK (document_type IN ('aadhaar','vendor_aadhaar','driving_licence','vehicle_rc','vendor_gst','vendor_pan'))" ); await client.query(` CREATE TABLE IF NOT EXISTS membership_payment_requests ( id BIGSERIAL PRIMARY KEY, user_id BIGINT NOT NULL REFERENCES users(id) ON DELETE CASCADE, plan_months INTEGER NOT NULL CHECK (plan_months IN (1,3,6)), amount_rupees INTEGER NOT NULL CHECK (amount_rupees IN (51,151,301)), utr VARCHAR(40) NOT NULL UNIQUE, status TEXT NOT NULL DEFAULT 'pending' CHECK (status IN ('pending','approved','rejected')), admin_note TEXT, created_at TIMESTAMPTZ NOT NULL DEFAULT now(), reviewed_at TIMESTAMPTZ, reviewed_by TEXT ) `); await client.query(` CREATE TABLE IF NOT EXISTS admin_membership_overrides ( user_id BIGINT PRIMARY KEY REFERENCES users(id) ON DELETE CASCADE, status TEXT NOT NULL CHECK (status IN ('paid','unpaid')), note TEXT NOT NULL DEFAULT '', updated_at TIMESTAMPTZ NOT NULL DEFAULT now() ) `); await client.query("CREATE TABLE IF NOT EXISTS admin_notifications (id BIGSERIAL PRIMARY KEY, title TEXT NOT NULL, body TEXT NOT NULL, kind TEXT NOT NULL DEFAULT 'info', is_read BOOLEAN NOT NULL DEFAULT false, created_at TIMESTAMPTZ NOT NULL DEFAULT now())"); await client.query("COMMIT"); transactionOpen = false; databaseReady = true; console.log("Database schema initialized successfully. databaseReady=true"); } catch (error) { if (transactionOpen) { try { await client.query("ROLLBACK"); } catch (_) {} } throw error; } finally { client.release(); } } let dutyAutoBookingTimer = null;
+
+async function autoBookExpiredDuties() {
+  if (!databaseReady) return 0;
+  const client = await pool.connect();
+  try {
+    await client.query("BEGIN");
+    // One transaction-scoped lock prevents concurrent Render processes from duplicating the work.
+    await client.query("SELECT pg_advisory_xact_lock($1)", [741029319]);
+    const result = await client.query(
+      "UPDATE duties SET status='booked' " +
+      "WHERE status IN ('open','accepted') " +
+      "AND duty_date IS NOT NULL AND duty_time IS NOT NULL " +
+      "AND (duty_date + duty_time) <= (now() AT TIME ZONE 'Asia/Kolkata') " +
+      "RETURNING id"
+    );
+    await client.query("COMMIT");
+    if (result.rowCount > 0) {
+      console.log("Automatically marked expired duties as booked:", result.rowCount);
+      broadcastDutyUpdate();
+    }
+    return result.rowCount;
+  } catch (error) {
+    await client.query("ROLLBACK").catch(() => {});
+    throw error;
+  } finally {
+    client.release();
+  }
+}
+
+function startDutyAutoBookingScheduler() {
+  if (dutyAutoBookingTimer) return;
+  const run = () => {
+    autoBookExpiredDuties().catch((error) => {
+      console.error("Automatic duty booking check failed:", error.message);
+    });
+  };
+  run();
+  dutyAutoBookingTimer = setInterval(run, 60 * 1000);
+  if (typeof dutyAutoBookingTimer.unref === "function") dutyAutoBookingTimer.unref();
+}
+
+async function startServerWithDatabaseRetry() { // HTTP listener is already active; initialize the database in the background. databaseReady = false; let attempt = 0; while (true) { attempt += 1; try { console.log(`Starting database initialization attempt ${attempt}...`); await initializeDatabase(); startDutyAutoBookingScheduler(); console.log("Database initialization completed. API is ready."); return; } catch (error) { console.error( `Database initialization attempt ${attempt} failed:`, JSON.stringify({ code: error.code || "NO_CODE", message: error.message || String(error), detail: error.detail || null, hint: error.hint || null, table: error.table || null, constraint: error.constraint || null, stack: error.stack || null, }) ); const waitMs = Math.min(attempt * 5000, 30000); console.warn( `Database initialization will retry in ${waitMs / 1000} seconds.` ); await new Promise((resolve) => setTimeout(resolve, waitMs)); } } } startServerWithDatabaseRetry();
