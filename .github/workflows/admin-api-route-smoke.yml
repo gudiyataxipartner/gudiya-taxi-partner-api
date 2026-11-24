@@ -24,6 +24,23 @@ jobs:
         with:
           node-version: "22"
 
+      - name: Locate backend JavaScript parse errors
+        shell: bash
+        run: |
+          set -euo pipefail
+          npm install --no-save --ignore-scripts acorn@8
+          node - <<'JS'
+          const fs = require('fs');
+          const acorn = require('acorn');
+          const source = fs.readFileSync('src/server.js', 'utf8');
+          try {
+            acorn.parse(source, { ecmaVersion: 'latest', sourceType: 'script' });
+            console.log('Acorn parse passed.');
+          } catch (error) {
+            console.error('Backend parse error:', error.message, error.loc || '');
+            process.exit(1);
+          }
+          JS
       - name: Validate backend JavaScript syntax
         run: node --check src/server.js
 
@@ -39,7 +56,7 @@ jobs:
             "/api/admin/export/users.csv"
             "/api/admin/export/duties.csv"
             "/api/admin/export/referrals.csv"
-            "/api/admin/export/activity.csv"
+            "/api/admin/export/activity.csv"\n            "/api/vehicles/available"\n            "/api/vehicles/available/mine"
           )
 
           for attempt in $(seq 1 60); do
