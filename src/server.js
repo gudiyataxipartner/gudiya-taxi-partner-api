@@ -2874,4 +2874,35 @@ function startDutyAutoBookingScheduler() {
   if (typeof dutyAutoBookingTimer.unref === "function") dutyAutoBookingTimer.unref();
 }
 
-async function startServerWithDatabaseRetry() { // HTTP listener is already active; initialize the database in the background. databaseReady = false; let attempt = 0; while (true) { attempt += 1; try { console.log(`Starting database initialization attempt ${attempt}...`); await initializeDatabase(); startDutyAutoBookingScheduler(); console.log("Database initialization completed. API is ready."); return; } catch (error) { console.error( `Database initialization attempt ${attempt} failed:`, JSON.stringify({ code: error.code || "NO_CODE", message: error.message || String(error), detail: error.detail || null, hint: error.hint || null, table: error.table || null, constraint: error.constraint || null, stack: error.stack || null, }) ); const waitMs = Math.min(attempt * 5000, 30000); console.warn( `Database initialization will retry in ${waitMs / 1000} seconds.` ); await new Promise((resolve) => setTimeout(resolve, waitMs)); } } } startServerWithDatabaseRetry();
+async function startServerWithDatabaseRetry() {
+  databaseReady = false;
+  let attempt = 0;
+  while (true) {
+    attempt += 1;
+    try {
+      console.log(`Starting database initialization attempt ${attempt}...`);
+      await initializeDatabase();
+      startDutyAutoBookingScheduler();
+      console.log("Database initialization completed. API is ready.");
+      return;
+    } catch (error) {
+      console.error(
+        `Database initialization attempt ${attempt} failed:`,
+        JSON.stringify({
+          code: error.code || "NO_CODE",
+          message: error.message || String(error),
+          detail: error.detail || null,
+          hint: error.hint || null,
+          table: error.table || null,
+          constraint: error.constraint || null,
+          stack: error.stack || null,
+        })
+      );
+      const waitMs = Math.min(attempt * 5000, 30000);
+      console.warn(`Database initialization will retry in ${waitMs / 1000} seconds.`);
+      await new Promise((resolve) => setTimeout(resolve, waitMs));
+    }
+  }
+}
+
+startServerWithDatabaseRetry();
