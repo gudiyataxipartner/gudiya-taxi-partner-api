@@ -370,6 +370,155 @@ function requireAdmin(req, res, next) {
   next();
 }
 
+// Stable Admin reporting routes, registered immediately after authentication.
+function adminCsvCell(value) {
+  const text = String(value == null ? "" : value);
+  const safe = /^[\s]*[=+\-@]/.test(text) ? "'" + text : text;
+  return '"' + safe.replace(/"/g, '""') + '"';
+}
+
+function adminSendCsv(res, filename, headers, rows) {
+  const lines = [
+    headers.map(adminCsvCell).join(","),
+    ...rows.map((row) => row.map(adminCsvCell).join(",")),
+  ];
+  res.set("Content-Type", "text/csv; charset=utf-8");
+  res.set("Content-Disposition", 'attachment; filename="' + filename + '"');
+  res.set("Cache-Control", "no-store");
+  res.send("\uFEFF" + lines.join("\r\n"));
+}
+
+app.get("/api/admin/activity", requireAdmin, async (req, res, next) => {
+  try {
+    const limit = Math.min(500, Math.max(1, Number(req.query.limit) || 100));
+    const result = await pool.query(
+      "SELECT id,action,subject_type,subject_id,details,created_at " +
+      "FROM audit_log ORDER BY created_at DESC LIMIT $1",
+      [limit]
+    );
+    res.json({ activities: result.rows, events: result.rows });
+  } catch (error) {
+    next(error);
+  }
+});
+
+app.get("/api/admin/security/sessions", requireAdmin, async (_req, res, next) => {
+  try {
+    const result = await pool.query(
+      "SELECT ds.user_id,u.name,u.phone,ds.device_id,ds.created_at,ds.last_seen_at,ds.revoked_at " +
+      "FROM device_sessions ds JOIN users u ON u.id=ds.user_id " +
+      "ORDER BY ds.last_seen_at DESC NULLS LAST LIMIT 300"
+    );
+    res.json({ sessions: result.rows });
+  } catch (error) {
+    next(error);
+  }
+});
+
+app.get("/api/admin/backup/export", requireAdmin, async (_req, res, next) => {
+  try {
+    const tables = {};
+    const queries = {
+      users: "SELECT id,name,phone,role_mode,driver_verification,vendor_verification,referral_code,referred_by_user_id,referral_qualified_at,created_at FROM users ORDER BY id",
+      duties: "SELECT * FROM duties ORDER BY id",
+      subscriptions: "SELECT * FROM subscriptions ORDER BY id",
+      membership_payment_requests: "SELECT * FROM membership_payment_requests ORDER BY id",
+      driver_documents: "SELECT id,user_id,document_type,status,reviewer_note,created_at,reviewed_at FROM driver_documents ORDER BY id",
+      device_sessions: "SELECT id,user_id,device_id,created_at,last_seen_at,revoked_at FROM device_sessions ORDER BY id",
+      audit_log: "SELECT * FROM audit_log ORDER BY id",
+      referral_reward_events: "SELECT * FROM referral_reward_events ORDER BY id",
+      admin_membership_overrides: "SELECT * FROM admin_membership_overrides ORDER BY user_id",
+      admin_notifications: "SELECT * FROM admin_notifications ORDER BY id",
+    };
+    for (const [table, query] of Object.entries(queries)) {
+      const exists = await pool.query("SELECT to_regclass($1) AS name", ["public." + table]);
+      if (!exists.rows[0] || !exists.rows[0].name) continue;
+      const result = await pool.query(query);
+      tables[table] = result.rows;
+    }
+    const data = {
+      createdAt: new Date().toISOString(),
+      type: "logical-json-export",
+      warning: "Sensitive admin export. Store securely. This is not a managed PostgreSQL backup.",
+      tables,
+    };
+    const day = new Date().toISOString().slice(0, 10);
+    res.set("Content-Disposition", 'attachment; filename="gudiya-admin-backup-' + day + '.json"');
+    res.set("Cache-Control", "no-store");
+    res.type("application/json").send(JSON.stringify(data));
+  } catch (error) {
+    next(error);
+  }
+});
+
+app.get("/api/admin/export/users.csv", requireAdmin, async (_req, res, next) => {
+  try {
+    const result = await pool.query(
+      "SELECT u.id,u.name,u.phone,u.role_mode,u.driver_verification,u.vendor_verification,u.created_at, " +
+      "COALESCE(o.status,CASE WHEN EXISTS(SELECT 1 FROM subscriptions s WHERE s.user_id=u.id " +
+      "AND s.status='active' AND s.current_period_end>now() " +
+      "AND (s.provider IN ('referral_reward','admin_extension') OR " +
+      "(s.provider='manual_upi' AND s.provider_payment_id IS NOT NULL))) " +
+      "THEN 'paid' ELSE 'unpaid' END) AS membership_status " +
+      "FROM users u LEFT JOIN admin_membership_overrides o ON o.user_id=u.id " +
+      "ORDER BY u.created_at DESC LIMIT 10000"
+    );
+    adminSendCsv(res, "gudiya-users.csv",
+      ["ID","Name","Phone","Role","Driver Verification","Vendor Verification","Joined","Membership"],
+      result.rows.map(x => [x.id,x.name,x.phone,x.role_mode,x.driver_verification,x.vendor_verification,x.created_at,x.membership_status]));
+  } catch (error) {
+    next(error);
+  }
+});
+
+app.get("/api/admin/export/duties.csv", requireAdmin, async (_req, res, next) => {
+  try {
+    const result = await pool.query(
+      "SELECT d.id,d.pickup_city,d.drop_city,d.vehicle_type,d.trip_type,d.duty_date,d.duty_time, " +
+      "d.status,d.payout_paise,u.name,u.phone,d.created_at FROM duties d " +
+      "JOIN users u ON u.id=d.user_id ORDER BY d.created_at DESC LIMIT 10000"
+    );
+    adminSendCsv(res, "gudiya-duties.csv",
+      ["Duty ID","Pickup","Drop","Vehicle","Trip","Date","Time","Status","Payout Rupees","Posted By","Phone","Created"],
+      result.rows.map(x => [x.id,x.pickup_city,x.drop_city,x.vehicle_type,x.trip_type,x.duty_date,x.duty_time,x.status,x.payout_paise==null?"":Number(x.payout_paise)/100,x.name,x.phone,x.created_at]));
+  } catch (error) {
+    next(error);
+  }
+});
+
+app.get("/api/admin/export/referrals.csv", requireAdmin, async (_req, res, next) => {
+  try {
+    const result = await pool.query(
+      "SELECT r.id AS referred_user_id,r.name AS referred_name,r.phone AS referred_phone, " +
+      "r.referral_code AS referred_code,p.name AS referrer_name,p.phone AS referrer_phone, " +
+      "p.referral_code AS referrer_code, " +
+      "CASE WHEN r.referral_qualified_at IS NULL THEN 'pending' ELSE 'successful' END AS referral_status, " +
+      "r.referral_qualified_at,r.created_at FROM users r " +
+      "LEFT JOIN users p ON p.id=r.referred_by_user_id " +
+      "WHERE r.referred_by_user_id IS NOT NULL ORDER BY r.created_at DESC LIMIT 10000"
+    );
+    adminSendCsv(res, "gudiya-referrals.csv",
+      ["Referred User ID","Referred Name","Referred Phone","Referred Code","Referrer Name","Referrer Phone","Referrer Code","Status","Qualified At","Joined"],
+      result.rows.map(x => [x.referred_user_id,x.referred_name,x.referred_phone,x.referred_code,x.referrer_name,x.referrer_phone,x.referrer_code,x.referral_status,x.referral_qualified_at,x.created_at]));
+  } catch (error) {
+    next(error);
+  }
+});
+
+app.get("/api/admin/export/activity.csv", requireAdmin, async (_req, res, next) => {
+  try {
+    const result = await pool.query(
+      "SELECT action,subject_type,subject_id,details,created_at " +
+      "FROM audit_log ORDER BY created_at DESC LIMIT 10000"
+    );
+    adminSendCsv(res, "gudiya-admin-activity.csv",
+      ["Action","Subject Type","Subject ID","Details","Created"],
+      result.rows.map(x => [x.action,x.subject_type,x.subject_id,typeof x.details==="string"?x.details:JSON.stringify(x.details),x.created_at]));
+  } catch (error) {
+    next(error);
+  }
+});
+
 // WhatsApp Admin inbox: additive schema; does not alter existing duty/user tables.
 let whatsappInboxSchemaReady = false;
 async function ensureWhatsAppInboxSchema() {
