@@ -38,6 +38,27 @@ jobs:
             console.log('Acorn parse passed.');
           } catch (error) {
             console.error('Backend parse error:', error.message, error.loc || '');
+            for (const suffix of ['}', '}}', '}}}', ')', ']', '});', '\\n}\\n']) {
+              try {
+                acorn.parse(source + suffix, { ecmaVersion: 'latest', sourceType: 'script' });
+                console.error('Appended suffix parses successfully:', JSON.stringify(suffix));
+                break;
+              } catch (_) {}
+            }
+            const tokenizer = acorn.tokenizer(source, { ecmaVersion: 'latest', sourceType: 'script' });
+            const stack = [];
+            const close = { '}':'{', ')':'(', ']':'[' };
+            while (true) {
+              const token = tokenizer.getToken();
+              const label = token.type.label;
+              if (label === 'eof') break;
+              if (label === '{' || label === '(' || label === '[') stack.push({label,line:token.loc.start.line,column:token.loc.start.column});
+              else if (label === '}' || label === ')' || label === ']') {
+                const expected = close[label];
+                if (stack.length && stack[stack.length-1].label === expected) stack.pop();
+              }
+            }
+            console.error('Unclosed delimiter stack:', JSON.stringify(stack.slice(-30)));
             process.exit(1);
           }
           JS
