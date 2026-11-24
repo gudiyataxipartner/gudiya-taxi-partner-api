@@ -1230,9 +1230,10 @@ app.post("/api/admin/whatsapp-duties/:id/publish", requireAdmin, async(req,res,n
       return res.status(400).json({error:"Duty date is not a valid calendar date"});
     if (!/^([01]\\d|2[0-3]):[0-5]\\d(?::[0-5]\\d)?$/.test(dutyTime))
       return res.status(400).json({error:"Duty time is required in 24-hour format"});
-    const payout = b.payoutRupees == null || b.payoutRupees === "" ? null : Math.round(Number(b.payoutRupees) * 100);
-    if (payout === null || !Number.isFinite(payout) || payout <= 0 || payout > 100000000)
-      return res.status(400).json({error:"A valid driver payment greater than zero is required"});
+    const payoutText = b.payoutRupees == null ? "" : String(b.payoutRupees).trim();
+    const payout = payoutText === "" ? null : Math.round(Number(payoutText) * 100);
+    if (payout !== null && (!Number.isFinite(payout) || payout < 0 || payout > 100000000))
+      return res.status(400).json({error:"Invalid payout"});
     const vendorPhone = String(process.env.WHATSAPP_VENDOR_PHONE || "").replace(/\D/g,"").slice(-10);
     if (!/^[6-9]\d{9}$/.test(vendorPhone))
       return res.status(503).json({error:"WHATSAPP_VENDOR_PHONE is not configured as a valid Indian mobile number"});
