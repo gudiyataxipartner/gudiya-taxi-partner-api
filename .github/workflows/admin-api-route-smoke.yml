@@ -1,0 +1,63 @@
+name: Verify Admin API Routes
+
+on:
+  push:
+    branches: [main]
+    paths:
+      - "src/server.js"
+      - ".github/workflows/admin-api-route-smoke.yml"
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  verify-admin-routes:
+    runs-on: ubuntu-latest
+    timeout-minutes: 12
+    steps:
+      - name: Checkout API repository
+        uses: actions/checkout@v4
+
+      - name: Set up Node 22
+        uses: actions/setup-node@v4
+        with:
+          node-version: "22"
+
+      - name: Validate backend JavaScript syntax
+        run: node --check src/server.js
+
+      - name: Wait for Render and verify protected Admin routes
+        shell: bash
+        run: |
+          set -euo pipefail
+          BASE="https://gudiya-taxi-partner-api-1.onrender.com"
+          ROUTES=(
+            "/api/admin/activity"
+            "/api/admin/security/sessions"
+            "/api/admin/backup/export"
+            "/api/admin/export/users.csv"
+            "/api/admin/export/duties.csv"
+            "/api/admin/export/referrals.csv"
+            "/api/admin/export/activity.csv"
+          )
+
+          for attempt in $(seq 1 60); do
+            all_ready=true
+            for route in "${ROUTES[@]}"; do
+              status="$(curl --silent --show-error --max-time 12 -o /tmp/admin-route-response.txt -w '%{http_code}' "$BASE$route" || true)"
+              if [[ "$status" != "401" && "$status" != "403" ]]; then
+                echo "Waiting for route $route; unauthenticated HTTP status: ${status:-000}"
+                all_ready=false
+                break
+              fi
+            done
+            if [[ "$all_ready" == "true" ]]; then
+              echo "All protected Admin routes are registered and reject unauthenticated requests."
+              exit 0
+            fi
+            sleep 10
+          done
+
+          echo "Admin route smoke test failed: one or more routes still return 404 or another unexpected status."
+          exit 1
