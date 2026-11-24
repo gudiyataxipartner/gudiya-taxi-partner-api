@@ -34,7 +34,23 @@ jobs:
           const acorn = require('acorn');
           const source = fs.readFileSync('src/server.js', 'utf8');
           try {
-            acorn.parse(source, { ecmaVersion: 'latest', sourceType: 'script' });
+            const ast = acorn.parse(source, { ecmaVersion: 'latest', sourceType: 'script', locations: true });
+            function inspect(node, parents=[]) {
+              if (node.type === 'FunctionDeclaration' && node.id && node.id.name === 'initializeDatabase') {
+                const scope = parents.filter(p => /Function|ArrowFunction/.test(p.type)).map(p => ({
+                  type:p.type, name:p.id && p.id.name || p.key && p.key.name || '(anonymous)',
+                  line:p.loc && p.loc.start.line
+                }));
+                console.log('initializeDatabase scope ancestry:', JSON.stringify(scope));
+                console.log('initializeDatabase declaration line:', node.loc.start.line);
+              }
+              for (const [key,value] of Object.entries(node)) {
+                if (key === 'loc' || key === 'start' || key === 'end') continue;
+                if (Array.isArray(value)) for (const child of value) if (child && typeof child.type === 'string') inspect(child,[...parents,node]);
+                else if (value && typeof value.type === 'string') inspect(value,[...parents,node]);
+              }
+            }
+            inspect(ast);
             console.log('Acorn parse passed.');
           } catch (error) {
             console.error('Backend parse error:', error.message, error.loc || '');
