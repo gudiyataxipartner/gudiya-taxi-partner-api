@@ -1,0 +1,49 @@
+name: Inspect Database Bootstrap Scope
+
+on:
+  push:
+    branches: [main]
+    paths:
+      - ".github/workflows/inspect-bootstrap-scope.yml"
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  inspect-scope:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-node@v4
+        with:
+          node-version: "22"
+      - name: Parse backend and inspect declaration scope
+        shell: bash
+        run: |
+          set -euo pipefail
+          npm install --no-save --ignore-scripts acorn@8
+          node - <<'JS'
+          const fs=require('fs');
+          const acorn=require('acorn');
+          const source=fs.readFileSync('src/server.js','utf8');
+          const ast=acorn.parse(source,{ecmaVersion:'latest',sourceType:'script',locations:true});
+          const target=new Set(['initializeDatabase','startServerWithDatabaseRetry','startDutyAutoBookingScheduler','autoBookExpiredDuties','adminCsvCell','csvCell']);
+          function walk(node,parents=[]) {
+            if(node.type==='FunctionDeclaration'&&node.id&&target.has(node.id.name)) {
+              const enclosing=parents.filter(p=>/Function|ArrowFunction/.test(p.type)).map(p=>({
+                type:p.type,
+                name:p.id&&p.id.name||p.key&&p.key.name||'(anonymous)',
+                line:p.loc&&p.loc.start.line
+              }));
+              console.log(node.id.name+' line '+node.loc.start.line+' enclosing scopes: '+JSON.stringify(enclosing));
+            }
+            for(const [key,value] of Object.entries(node)) {
+              if(key==='loc'||key==='start'||key==='end')continue;
+              if(Array.isArray(value)) {
+                for(const child of value)if(child&&typeof child.type==='string')walk(child,[...parents,node]);
+              } else if(value&&typeof value.type==='string')walk(value,[...parents,node]);
+            }
+          }
+          walk(ast);
+          JS
