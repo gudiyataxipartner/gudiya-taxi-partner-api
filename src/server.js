@@ -2342,7 +2342,11 @@ app.get("/api/admin/users/:id", requireAdmin, async (req, res, next) => {
           WHERE s.user_id=u.id
             AND s.status='active' AND s.current_period_end > now()
             AND (s.provider='referral_reward' OR s.provider='admin_extension' OR (s.provider='manual_upi' AND s.provider_payment_id IS NOT NULL))
-        ) THEN 'paid' ELSE 'unpaid' END) AS membership_status
+        ) THEN 'paid' ELSE 'unpaid' END) AS membership_status,
+        CASE WHEN EXISTS(
+          SELECT 1 FROM device_sessions ds WHERE ds.user_id=u.id
+            AND ds.revoked_at IS NULL AND ds.last_seen_at>now()-interval '30 days'
+        ) THEN 'active' ELSE 'inactive' END AS activity_status
       FROM users u
       LEFT JOIN admin_membership_overrides o ON o.user_id=u.id
       WHERE u.id=$1
