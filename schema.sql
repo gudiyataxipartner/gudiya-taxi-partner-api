@@ -183,3 +183,26 @@ CREATE TABLE IF NOT EXISTS duty_reports (id BIGSERIAL PRIMARY KEY, duty_id BIGIN
 ALTER TABLE duties ADD COLUMN IF NOT EXISTS is_featured BOOLEAN NOT NULL DEFAULT FALSE;
 CREATE INDEX IF NOT EXISTS duties_featured_created_idx ON duties(is_featured DESC, created_at DESC);
 CREATE INDEX IF NOT EXISTS duty_reports_status_created_idx ON duty_reports(status, created_at DESC);
+
+
+-- Available Vehicles marketplace (additive; existing users and duties are unchanged).
+CREATE TABLE IF NOT EXISTS available_vehicles (
+  id BIGSERIAL PRIMARY KEY,
+  user_id BIGINT NOT NULL REFERENCES users(id) ON DELETE CASCADE,
+  vehicle_type TEXT NOT NULL,
+  vehicle_model TEXT NOT NULL DEFAULT '',
+  registration_number TEXT NOT NULL DEFAULT '',
+  city TEXT NOT NULL,
+  seats INTEGER NOT NULL DEFAULT 4 CHECK (seats BETWEEN 1 AND 50),
+  available_from TIMESTAMPTZ NOT NULL DEFAULT now(),
+  available_until TIMESTAMPTZ,
+  notes TEXT NOT NULL DEFAULT '',
+  status TEXT NOT NULL DEFAULT 'available' CHECK (status IN ('available','unavailable')),
+  created_at TIMESTAMPTZ NOT NULL DEFAULT now(),
+  updated_at TIMESTAMPTZ NOT NULL DEFAULT now(),
+  CHECK (available_until IS NULL OR available_until > available_from)
+);
+CREATE INDEX IF NOT EXISTS available_vehicles_status_time_idx
+  ON available_vehicles(status, available_from, available_until);
+CREATE INDEX IF NOT EXISTS available_vehicles_user_created_idx
+  ON available_vehicles(user_id, created_at DESC);
