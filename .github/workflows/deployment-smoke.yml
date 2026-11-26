@@ -56,7 +56,7 @@ jobs:
           const release = String(info.releaseUrl || '');
           const parts = version.split('.');
           if (parts.length < 2 || parts.length > 4 ||
-              parts.some(p => !/^\\d+$/.test(p))) {
+              parts.some(p => !/^\d+$/.test(p))) {
             throw new Error('Admin version metadata is missing or invalid');
           }
           if (!apk.startsWith('https://github.com/gudiyataxipartner/gudiya-taxi-partner-admin/releases/download/')) {
