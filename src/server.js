@@ -211,7 +211,7 @@ async function getPublishedAppVersionInfo() {
     });
     if (!response.ok) throw new Error("Latest app release is temporarily unavailable");
     const release = await response.json();
-    const releaseLines = String(release.body || "").split("\\n").map((line) => line.trim());
+    const releaseLines = String(release.body || "").split(String.fromCharCode(10)).map((line) => line.trim());
     const getReleaseField = (label) => {
       const prefix = label.toLowerCase();
       const line = releaseLines.find((item) => item.toLowerCase().startsWith(prefix));
