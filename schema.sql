@@ -37,6 +37,7 @@ CREATE TABLE IF NOT EXISTS duties (
   distance_km NUMERIC(8,1),
   distance_label TEXT NOT NULL DEFAULT 'लगभग दूरी',
   created_at TIMESTAMPTZ NOT NULL DEFAULT now(),
+  auto_booked_at TIMESTAMPTZ,
   status TEXT NOT NULL DEFAULT 'open' CHECK (status IN ('open','accepted','completed','cancelled')),
   source_type TEXT,
   source_group TEXT,
@@ -46,6 +47,7 @@ CREATE TABLE IF NOT EXISTS duties (
 );
 CREATE UNIQUE INDEX IF NOT EXISTS duties_source_message_hash_unique ON duties(source_message_hash) WHERE source_message_hash IS NOT NULL;
 CREATE INDEX IF NOT EXISTS duties_open_created ON duties(status, created_at DESC);
+CREATE INDEX IF NOT EXISTS duties_auto_booked_cleanup_idx ON duties(auto_booked_at, id) WHERE auto_booked_at IS NOT NULL;
 CREATE TABLE IF NOT EXISTS subscriptions (
   id BIGSERIAL PRIMARY KEY,
   user_id BIGINT NOT NULL REFERENCES users(id) ON DELETE CASCADE,
