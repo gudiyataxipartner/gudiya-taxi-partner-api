@@ -190,6 +190,68 @@ app.use(
   })
 );
 
+// Public version metadata for the Android app. It reads the latest published
+// GitHub Release so every future APK release automatically updates the gate.
+const GUDIYA_LATEST_RELEASE_API =
+  "https://api.github.com/repos/gudiyataxipartner/gudiya-taxi-partner/releases/latest";
+let appReleaseCache = null;
+let appReleaseCacheUntil = 0;
+let appReleaseFetchInFlight = null;
+
+async function getPublishedAppVersionInfo() {
+  if (appReleaseCache && Date.now() < appReleaseCacheUntil) return appReleaseCache;
+  if (appReleaseFetchInFlight) return appReleaseFetchInFlight;
+  appReleaseFetchInFlight = (async () => {
+    const response = await fetch(GUDIYA_LATEST_RELEASE_API, {
+      headers: {
+        Accept: "application/vnd.github+json",
+        "User-Agent": "Gudiya-Taxi-Partner-Android-App",
+      },
+      signal: AbortSignal.timeout(7000),
+    });
+    if (!response.ok) throw new Error("Latest app release is temporarily unavailable");
+    const release = await response.json();
+    const body = String(release.body || "");
+    const versionMatch = body.match(/^\\s*Version:\\s*(\\d+(?:\\.\\d+){1,3})\\s*$/im);
+    const minimumMatch = body.match(/^\\s*Minimum supported version:\\s*(\\d+(?:\\.\\d+){1,3})\\s*$/im);
+    const latestVersion = versionMatch?.[1] || "";
+    const minimumSupportedVersion = minimumMatch?.[1] || latestVersion;
+    const apk = Array.isArray(release.assets)
+      ? release.assets.find((asset) => asset.name === "gudiya-taxi-partner.apk")
+      : null;
+    if (!latestVersion || !minimumSupportedVersion || !apk?.browser_download_url) {
+      throw new Error("Latest app release metadata is incomplete");
+    }
+    const result = {
+      latestVersion,
+      minimumSupportedVersion,
+      apkUrl: apk.browser_download_url,
+      releaseUrl: String(release.html_url || "https://github.com/gudiyataxipartner/gudiya-taxi-partner/releases/latest"),
+    };
+    appReleaseCache = result;
+    appReleaseCacheUntil = Date.now() + 5 * 60 * 1000;
+    return result;
+  })();
+  try {
+    return await appReleaseFetchInFlight;
+  } finally {
+    appReleaseFetchInFlight = null;
+  }
+}
+
+app.get("/api/app-version", async (_req, res) => {
+  try {
+    const info = await getPublishedAppVersionInfo();
+    res.set("Cache-Control", "public, max-age=60, stale-while-revalidate=240");
+    return res.json(info);
+  } catch (error) {
+    console.error("Android app version check failed:", error.message);
+    return res.status(503).set("Cache-Control", "no-store").json({
+      error: "App update information is temporarily unavailable",
+    });
+  }
+});
+
 function requireConfig() {
   if (!process.env.JWT_SECRET || process.env.JWT_SECRET.length < 32)
     throw new Error(
