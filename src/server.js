@@ -1361,13 +1361,15 @@ app.post("/api/admin/whatsapp-duties/:id/publish", requireAdmin, async(req,res,n
     const dutyDate = String(b.dutyDate || "").trim();
     if (!pickup || !drop || !vehicle || !["one_way","round_trip","local_booking"].includes(trip))
       return res.status(400).json({error:"Pickup, drop, vehicle and an explicitly selected trip type are required"});
-    if (!/^20\d{2}-\d{2}-\d{2}$/.test(dutyDate))
-      return res.status(400).json({error:"Duty date is required"});
-    const dateCheck = new Date(dutyDate + "T00:00:00.000Z");
-    if (Number.isNaN(dateCheck.getTime()) || dateCheck.toISOString().slice(0,10) !== dutyDate)
-      return res.status(400).json({error:"Duty date is not a valid calendar date"});
-    if (!/^([01]\d|2[0-3]):[0-5]\d(?::[0-5]\d)?$/.test(dutyTime))
-      return res.status(400).json({error:"Duty time is required in 24-hour format"});
+    if (dutyDate) {
+      if (!/^20\\d{2}-\\d{2}-\\d{2}$/.test(dutyDate))
+        return res.status(400).json({error:"Duty date must use YYYY-MM-DD format"});
+      const dateCheck = new Date(dutyDate + "T00:00:00.000Z");
+      if (Number.isNaN(dateCheck.getTime()) || dateCheck.toISOString().slice(0,10) !== dutyDate)
+        return res.status(400).json({error:"Duty date is not a valid calendar date"});
+    }
+    if (dutyTime && !/^([01]\\d|2[0-3]):[0-5]\\d(?::[0-5]\\d)?$/.test(dutyTime))
+      return res.status(400).json({error:"Duty time must use 24-hour format"});
     const payoutText = b.payoutRupees == null ? "" : String(b.payoutRupees).trim();
     const payout = payoutText === "" ? null : Math.round(Number(payoutText) * 100);
     if (payout !== null && (!Number.isFinite(payout) || payout < 0 || payout > 100000000))
@@ -1404,7 +1406,7 @@ app.post("/api/admin/whatsapp-duties/:id/publish", requireAdmin, async(req,res,n
     }
     const duty = await client.query(`INSERT INTO duties(user_id,role_posted_as,pickup_city,drop_city,vehicle_type,trip_type,duty_date,duty_time,payout_paise,notes_private,distance_label,source_type,source_group,source_poster_name,source_poster_phone)
       VALUES($1,'vendor',$2,$3,$4,$5,$6,$7,$8,$9,'लगभग दूरी','whatsapp',NULL,$10,$11) RETURNING id`,
-      [vendor.rows[0].id,pickup,drop,vehicle,trip,dutyDate,dutyTime || null,payout,String(inbox.rows[0].message_text).slice(0,1000),getWhatsAppPosterName(inbox.rows[0].sender_name,inbox.rows[0].group_name),contactPhone]);
+      [vendor.rows[0].id,pickup,drop,vehicle,trip,dutyDate || null,dutyTime || null,payout,String(inbox.rows[0].message_text).slice(0,1000),getWhatsAppPosterName(inbox.rows[0].sender_name,inbox.rows[0].group_name),contactPhone]);
     await client.query("UPDATE admin_whatsapp_duties SET status='published',duty_id=$2,reviewed_at=now() WHERE id=$1",[id,duty.rows[0].id]);
     await client.query("INSERT INTO audit_log(action,subject_type,subject_id,details) VALUES('whatsapp_duty_published','duty',$1,$2)",
       [String(duty.rows[0].id),JSON.stringify({inboxId:id,admin:req.admin?.username || "admin"})]);
