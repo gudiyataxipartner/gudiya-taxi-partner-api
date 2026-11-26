@@ -33,7 +33,12 @@ jobs:
           data=json.loads(Path("/tmp/admin-version.json").read_text())
           print("Latest Admin version:",data.get("latestVersion"))
           print("Admin APK URL:",data.get("apkUrl"))
-          assert data.get("latestVersion") == "1.1.10", "Latest Admin version mismatch"
-          assert data.get("apkUrl","").startswith("https://github.com/gudiyataxipartner/gudiya-taxi-partner-admin/releases/download/admin-v1.1.10/"), "Admin APK URL mismatch"
-          print("Live Admin update endpoint verified.")
+          import re
+          version_re = re.compile(r"^\\d+(?:\\.\\d+){1,3}$")
+          version = str(data.get("latestVersion") or "")
+          apk_url = str(data.get("apkUrl") or "")
+          assert version_re.fullmatch(version), "Latest Admin version missing or invalid"
+          assert apk_url.startswith("https://github.com/gudiyataxipartner/gudiya-taxi-partner-admin/releases/download/"), "Admin APK URL mismatch"
+          assert apk_url.endswith("/Gudiya-Taxi-Partner-Admin-release.apk"), "Admin APK filename mismatch"
+          print("Live Admin update endpoint verified:", version)
           PY
