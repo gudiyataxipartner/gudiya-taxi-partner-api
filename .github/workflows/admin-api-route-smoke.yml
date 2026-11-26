@@ -93,7 +93,9 @@ jobs:
             "/api/admin/export/users.csv"
             "/api/admin/export/duties.csv"
             "/api/admin/export/referrals.csv"
-            "/api/admin/export/activity.csv"\n            "/api/vehicles/available"\n            "/api/vehicles/available/mine"
+            "/api/admin/export/activity.csv"
+            "/api/vehicles/available"
+            "/api/vehicles/available/mine"
           )
 
           for attempt in $(seq 1 60); do
