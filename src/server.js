@@ -278,6 +278,32 @@ let adminReleaseCacheUntil = 0;
 let adminReleaseFetchInFlight = null;
 
 async function getPublishedAdminAppVersionInfo() {
+  // The Admin repository is private, so an unauthenticated GitHub Releases
+  // request from Render cannot read its latest release. Prefer explicit
+  // deployment metadata configured on Render; fall back to GitHub only when
+  // these values are not configured.
+  const configuredVersion = String(process.env.GUDIYA_ADMIN_APP_LATEST_VERSION || "").trim();
+  const configuredApkUrl = String(process.env.GUDIYA_ADMIN_APP_APK_URL || "").trim();
+  const configuredReleaseUrl = String(process.env.GUDIYA_ADMIN_APP_RELEASE_URL || "").trim();
+  const configuredParts = configuredVersion.split(".");
+  const configuredVersionIsValid =
+    configuredParts.length >= 2 &&
+    configuredParts.length <= 4 &&
+    configuredParts.every(part => part !== "" && Number.isSafeInteger(Number(part)) && Number(part) >= 0);
+  if (
+    configuredVersionIsValid &&
+    configuredApkUrl.startsWith("https://github.com/") &&
+    configuredReleaseUrl.startsWith("https://github.com/")
+  ) {
+    const result = {
+      latestVersion: configuredVersion,
+      apkUrl: configuredApkUrl,
+      releaseUrl: configuredReleaseUrl
+    };
+    adminReleaseCache = result;
+    adminReleaseCacheUntil = Date.now() + 5 * 60 * 1000;
+    return result;
+  }
   if (adminReleaseCache && Date.now() < adminReleaseCacheUntil) return adminReleaseCache;
   if (adminReleaseFetchInFlight) return adminReleaseFetchInFlight;
   adminReleaseFetchInFlight = (async () => {
