@@ -105,19 +105,26 @@ try {
 }
 
 async function sendPushToUserIds(userIds, title, body, extraData = {}) {
-  if (!Array.isArray(userIds) || !userIds.length) return;
+  if (!Array.isArray(userIds) || !userIds.length) {
+    console.warn("Push skipped: no eligible recipient users.", String(title || ""));
+    return;
+  }
   if (!firebaseMessaging) {
     console.warn("Push skipped: Firebase Admin is not configured.", firebasePushSetupError);
     return;
   }
   try {
     const ids = [...new Set(userIds.map(String).filter((id) => /^\d+$/.test(id)))];
-    if (!ids.length) return;
+    if (!ids.length) {
+      console.warn("Push skipped: recipient user IDs are not valid.", String(title || ""));
+      return;
+    }
     const found = await pool.query(
       "SELECT token FROM push_tokens WHERE user_id = ANY($1::bigint[])",
       [ids]
     );
     const tokens = found.rows.map((row) => row.token).filter(Boolean);
+    console.log("Push dispatch check:", JSON.stringify({title:String(title || ""),recipientUsers:ids.length,registeredTokens:tokens.length}));
     if (!tokens.length) {
       console.warn("Push skipped: no registered FCM tokens for recipient count:", ids.length);
       return;
@@ -1056,6 +1063,7 @@ app.post("/api/push/register-token", requireAuth, async (req, res, next) => {
       ON CONFLICT(token) DO UPDATE SET user_id=EXCLUDED.user_id,last_seen_at=now()`,
       [token, req.auth.user_id]
     );
+    console.log("FCM device token registered successfully.");
     return res.json({ ok: true, registered: true });
   } catch (e) {
     next(e);
