@@ -2461,6 +2461,63 @@ app.post(
   }
 );
 
+// Admin can immediately move every account to Unpaid without deleting user data.
+app.post("/api/admin/membership/unpaid-all", requireAdmin, async (req, res, next) => {
+  const client = await pool.connect();
+  try {
+    await client.query("BEGIN");
+    await client.query("SELECT pg_advisory_xact_lock($1)", [741029321]);
+    const cutoff = await client.query("SELECT now() AS reset_at");
+    const resetAt = cutoff.rows[0].reset_at;
+    const expired = await client.query(
+      `UPDATE subscriptions
+          SET status='expired',updated_at=now()
+        WHERE lower(trim(status))='active'
+          AND created_at <= $1
+        RETURNING id`,
+      [resetAt]
+    );
+    const removedPaidOverrides = await client.query(
+      `DELETE FROM admin_membership_overrides
+        WHERE lower(trim(status))='paid'
+          AND updated_at <= $1
+        RETURNING user_id`,
+      [resetAt]
+    );
+    const eventKey = "admin-unpaid-all-" + Date.now();
+    await client.query(
+      `INSERT INTO membership_global_reset_events
+        (event_key,scheduled_at,executed_at,affected_subscriptions,affected_overrides)
+       VALUES($1,$2,$2,$3,$4)`,
+      [eventKey,resetAt,expired.rowCount,removedPaidOverrides.rowCount]
+    );
+    await client.query(
+      `INSERT INTO audit_log(action,subject_type,subject_id,details)
+       VALUES('global_membership_reset','membership','all-users',$1)`,
+      [JSON.stringify({
+        eventKey,
+        resetAt,
+        expiredSubscriptions:expired.rowCount,
+        removedPaidOverrides:removedPaidOverrides.rowCount,
+        admin:req.admin?.username || "admin-api-key"
+      })]
+    );
+    await client.query("COMMIT");
+    return res.json({
+      ok:true,
+      message:"सभी Users की Membership Unpaid कर दी गई। किसी का account, document या duty delete नहीं हुआ।",
+      affectedSubscriptions:expired.rowCount,
+      affectedOverrides:removedPaidOverrides.rowCount,
+      resetAt
+    });
+  } catch (error) {
+    await client.query("ROLLBACK").catch(() => {});
+    next(error);
+  } finally {
+    client.release();
+  }
+});
+
 app.get(
   "/api/admin/membership/payments/pending",
   requireAdmin,
@@ -3118,97 +3175,9 @@ const schemaCandidates = [ path.join(__dirname, "schema.sql"), path.join(__dirna
         affected_overrides INTEGER NOT NULL DEFAULT 0,
         created_at TIMESTAMPTZ NOT NULL DEFAULT now()
       )`);
-      await client.query(`INSERT INTO membership_global_reset_events(event_key,scheduled_at)
-        VALUES('all-users-unpaid-2026-11-30-2345-ist','2026-11-30T18:15:00Z'::timestamptz)
-        ON CONFLICT(event_key) DO NOTHING`);
-      await client.query("COMMIT"); transactionOpen = false; databaseReady = true; console.log("Database schema initialized successfully. databaseReady=true"); } catch (error) { if (transactionOpen) { try { await client.query("ROLLBACK"); } catch (_) {} } throw error; } finally { client.release(); } } let membershipGlobalResetTimer = null;
-let membershipGlobalResetInFlight = null;
-
-async function runScheduledMembershipResets() {
-  if (!databaseReady) return 0;
-  if (membershipGlobalResetInFlight) return membershipGlobalResetInFlight;
-  membershipGlobalResetInFlight = (async () => {
-    const client = await pool.connect();
-    try {
-      await client.query("BEGIN");
-      await client.query("SELECT pg_advisory_xact_lock($1)", [741029321]);
-      const due = await client.query(`
-        SELECT event_key,scheduled_at
-        FROM membership_global_reset_events
-        WHERE executed_at IS NULL AND scheduled_at <= now()
-        ORDER BY scheduled_at
-        LIMIT 1
-        FOR UPDATE
-      `);
-      if (!due.rowCount) {
-        await client.query("COMMIT");
-        return 0;
-      }
-      const event = due.rows[0];
-      const scheduledAt = event.scheduled_at;
-      const expiredSubscriptions = await client.query(
-        `UPDATE subscriptions
-           SET status='expired',updated_at=now()
-         WHERE lower(trim(status))='active'
-           AND created_at <= $1
-         RETURNING id`,
-        [scheduledAt]
-      );
-      // Remove only pre-reset Paid overrides. With subscriptions expired above,
-      // those accounts now fall back to Unpaid. Existing explicit Unpaid overrides remain.
-      const unpaidOverrides = await client.query(
-        `DELETE FROM admin_membership_overrides
-         WHERE status='paid' AND updated_at <= $1
-         RETURNING user_id`,
-        [scheduledAt]
-      );
-      await client.query(
-        `UPDATE membership_global_reset_events
-           SET executed_at=now(),affected_subscriptions=$2,affected_overrides=$3
-         WHERE event_key=$1`,
-        [event.event_key, expiredSubscriptions.rowCount, unpaidOverrides.rowCount]
-      );
-      await client.query(
-        `INSERT INTO audit_log(action,subject_type,subject_id,details)
-         VALUES('global_membership_reset','membership','all-users',$1)`,
-        [JSON.stringify({
-          eventKey:event.event_key,
-          scheduledAt,
-          expiredSubscriptions:expiredSubscriptions.rowCount,
-          unpaidOverrides:unpaidOverrides.rowCount
-        })]
-      );
-      await client.query("COMMIT");
-      console.log("Scheduled all-user membership reset completed:", JSON.stringify({
-        eventKey:event.event_key,
-        scheduledAt,
-        expiredSubscriptions:expiredSubscriptions.rowCount,
-        unpaidOverrides:unpaidOverrides.rowCount
-      }));
-      return 1;
-    } catch (error) {
-      await client.query("ROLLBACK").catch(() => {});
-      console.error("Scheduled all-user membership reset failed:", error.stack || error.message);
-      throw error;
-    } finally {
-      client.release();
-    }
-  })().finally(() => {
-    membershipGlobalResetInFlight = null;
-  });
-  return membershipGlobalResetInFlight;
-}
-
-function startMembershipGlobalResetScheduler() {
-  if (membershipGlobalResetTimer) return;
-  const run = () => runScheduledMembershipResets().catch(error =>
-    console.error("Membership reset scheduler check failed:", error.message)
-  );
-  run();
-  membershipGlobalResetTimer = setInterval(run, 10 * 1000);
-  if (typeof membershipGlobalResetTimer.unref === "function") membershipGlobalResetTimer.unref();
-}
-
+      // Manual UNPAID ALL replaces the old timed reset. Cancel any pending legacy schedule.
+      await client.query("DELETE FROM membership_global_reset_events WHERE event_key='all-users-unpaid-2026-11-30-2345-ist' AND executed_at IS NULL");
+      await client.query("COMMIT"); transactionOpen = false; databaseReady = true; console.log("Database schema initialized successfully. databaseReady=true"); } catch (error) { if (transactionOpen) { try { await client.query("ROLLBACK"); } catch (_) {} } throw error; } finally { client.release(); } } 
 let dutyAutoBookingTimer = null;
 
 async function autoBookExpiredDuties() {
@@ -3328,7 +3297,7 @@ async function startServerWithDatabaseRetry() {
       console.log(`Starting database initialization attempt ${attempt}...`);
       await initializeDatabase();
       startDutyAutoBookingScheduler();
-      startMembershipGlobalResetScheduler();
+
       console.log("Database initialization completed. API is ready.");
       return;
     } catch (error) {
