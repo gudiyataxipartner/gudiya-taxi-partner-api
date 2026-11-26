@@ -177,6 +177,18 @@ CREATE TABLE IF NOT EXISTS admin_notifications (
   created_at TIMESTAMPTZ NOT NULL DEFAULT now()
 );
 
+CREATE TABLE IF NOT EXISTS membership_global_reset_events (
+  event_key TEXT PRIMARY KEY,
+  scheduled_at TIMESTAMPTZ NOT NULL,
+  executed_at TIMESTAMPTZ,
+  affected_subscriptions INTEGER NOT NULL DEFAULT 0,
+  affected_overrides INTEGER NOT NULL DEFAULT 0,
+  created_at TIMESTAMPTZ NOT NULL DEFAULT now()
+);
+INSERT INTO membership_global_reset_events(event_key,scheduled_at)
+VALUES('all-users-unpaid-2026-11-30-2345-ist','2026-11-30T18:15:00Z'::timestamptz)
+ON CONFLICT(event_key) DO NOTHING;
+
 
 -- Gudiya Taxi Partner feature additions (additive / non-destructive)
 CREATE TABLE IF NOT EXISTS user_route_alert_preferences (user_id BIGINT PRIMARY KEY REFERENCES users(id) ON DELETE CASCADE, pickup_city TEXT NOT NULL DEFAULT '', drop_city TEXT NOT NULL DEFAULT '', enabled BOOLEAN NOT NULL DEFAULT TRUE, updated_at TIMESTAMPTZ NOT NULL DEFAULT now());
