@@ -3012,7 +3012,10 @@ app.use((err, _req, res, _next) => { console.error(err.message); const status = 
 const schemaCandidates = [ path.join(__dirname, "schema.sql"), path.join(__dirname, "..", "schema.sql"), path.join(process.cwd(), "schema.sql"), path.join(process.cwd(), "src", "schema.sql"), ]; const schemaPath = schemaCandidates.find((candidate) => fs.existsSync(candidate) ); if (!schemaPath) { throw new Error( "schema.sql not found. Checked: " + schemaCandidates.join(", ") + ". Ensure schema.sql is committed to the deployed repository root." ); } async function initializeDatabase() { const client = await pool.connect(); let transactionOpen = false; try { await client.query("BEGIN"); transactionOpen = true;
       // All app instances use the same transaction-scoped lock key.
       // A second instance waits here instead of running ALTER/CREATE concurrently.
-      await client.query("SELECT pg_advisory_xact_lock($1)", [741029316]); console.log("Loading database schema from:", schemaPath); const schemaSql = fs.readFileSync(schemaPath, "utf8"); await client.query(schemaSql); await client.query( "ALTER TABLE duties ADD COLUMN IF NOT EXISTS trip_type TEXT NOT NULL DEFAULT 'one_way'" ); await client.query( "ALTER TABLE duties DROP CONSTRAINT IF EXISTS duties_trip_type_check" ); await client.query( "ALTER TABLE duties ADD CONSTRAINT duties_trip_type_check CHECK (trip_type IN ('one_way','round_trip','local_booking'))" ); await client.query( "ALTER TABLE users ADD COLUMN IF NOT EXISTS password_hash TEXT" ); await client.query( "ALTER TABLE users ADD COLUMN IF NOT EXISTS referral_code TEXT" ); await client.query( "ALTER TABLE users ADD COLUMN IF NOT EXISTS referred_by_user_id BIGINT REFERENCES users(id) ON DELETE SET NULL" ); await client.query( "ALTER TABLE users ADD COLUMN IF NOT EXISTS first_paid_membership_at TIMESTAMPTZ" ); await client.query( "ALTER TABLE users ADD COLUMN IF NOT EXISTS referral_qualified_at TIMESTAMPTZ" ); await client.query(` UPDATE users SET referral_code='GTP' || upper(substr(md5(id::text || random()::text),1,10)) WHERE referral_code IS NULL `); await client.query( "CREATE UNIQUE INDEX IF NOT EXISTS users_referral_code_unique ON users(referral_code)" ); await client.query(` CREATE TABLE IF NOT EXISTS referral_reward_events ( id BIGSERIAL PRIMARY KEY, referrer_user_id BIGINT NOT NULL REFERENCES users(id) ON DELETE CASCADE, milestone INTEGER NOT NULL CHECK (milestone IN (15,50)), months_awarded INTEGER NOT NULL CHECK (months_awarded IN (1,2)), subscription_id BIGINT REFERENCES subscriptions(id) ON DELETE SET NULL, created_at TIMESTAMPTZ NOT NULL DEFAULT now(), UNIQUE(referrer_user_id,milestone) ) `); await client.query( "ALTER TABLE users ADD COLUMN IF NOT EXISTS vendor_verification TEXT NOT NULL DEFAULT 'not_submitted'" ); await client.query( "ALTER TABLE driver_documents ADD COLUMN IF NOT EXISTS encrypted_payload TEXT" ); await client.query( "ALTER TABLE driver_documents DROP CONSTRAINT IF EXISTS driver_documents_document_type_check" ); await client.query( "ALTER TABLE driver_documents ADD CONSTRAINT driver_documents_document_type_check CHECK (document_type IN ('aadhaar','vendor_aadhaar','driving_licence','vehicle_rc','vendor_gst','vendor_pan'))" ); await client.query(` CREATE TABLE IF NOT EXISTS membership_payment_requests ( id BIGSERIAL PRIMARY KEY, user_id BIGINT NOT NULL REFERENCES users(id) ON DELETE CASCADE, plan_months INTEGER NOT NULL CHECK (plan_months IN (1,3,6)), amount_rupees INTEGER NOT NULL CHECK (amount_rupees IN (51,151,301)), utr VARCHAR(40) NOT NULL UNIQUE, status TEXT NOT NULL DEFAULT 'pending' CHECK (status IN ('pending','approved','rejected')), admin_note TEXT, created_at TIMESTAMPTZ NOT NULL DEFAULT now(), reviewed_at TIMESTAMPTZ, reviewed_by TEXT ) `); await client.query(` CREATE TABLE IF NOT EXISTS admin_membership_overrides ( user_id BIGINT PRIMARY KEY REFERENCES users(id) ON DELETE CASCADE, status TEXT NOT NULL CHECK (status IN ('paid','unpaid')), note TEXT NOT NULL DEFAULT '', updated_at TIMESTAMPTZ NOT NULL DEFAULT now() ) `); await client.query("CREATE TABLE IF NOT EXISTS admin_notifications (id BIGSERIAL PRIMARY KEY, title TEXT NOT NULL, body TEXT NOT NULL, kind TEXT NOT NULL DEFAULT 'info', is_read BOOLEAN NOT NULL DEFAULT false, created_at TIMESTAMPTZ NOT NULL DEFAULT now())"); await client.query("COMMIT"); transactionOpen = false; databaseReady = true; console.log("Database schema initialized successfully. databaseReady=true"); } catch (error) { if (transactionOpen) { try { await client.query("ROLLBACK"); } catch (_) {} } throw error; } finally { client.release(); } } let dutyAutoBookingTimer = null;
+      await client.query("SELECT pg_advisory_xact_lock($1)", [741029316]); console.log("Loading database schema from:", schemaPath); const schemaSql = fs.readFileSync(schemaPath, "utf8"); await client.query(schemaSql); await client.query( "ALTER TABLE duties ADD COLUMN IF NOT EXISTS trip_type TEXT NOT NULL DEFAULT 'one_way'" );
+      // Set only by the expiry scheduler; applies equally to WhatsApp-imported and manual duties.
+      await client.query("ALTER TABLE duties ADD COLUMN IF NOT EXISTS auto_booked_at TIMESTAMPTZ");
+      await client.query("CREATE INDEX IF NOT EXISTS duties_auto_booked_cleanup_idx ON duties(auto_booked_at, id) WHERE auto_booked_at IS NOT NULL"); await client.query( "ALTER TABLE duties DROP CONSTRAINT IF EXISTS duties_trip_type_check" ); await client.query( "ALTER TABLE duties ADD CONSTRAINT duties_trip_type_check CHECK (trip_type IN ('one_way','round_trip','local_booking'))" ); await client.query( "ALTER TABLE users ADD COLUMN IF NOT EXISTS password_hash TEXT" ); await client.query( "ALTER TABLE users ADD COLUMN IF NOT EXISTS referral_code TEXT" ); await client.query( "ALTER TABLE users ADD COLUMN IF NOT EXISTS referred_by_user_id BIGINT REFERENCES users(id) ON DELETE SET NULL" ); await client.query( "ALTER TABLE users ADD COLUMN IF NOT EXISTS first_paid_membership_at TIMESTAMPTZ" ); await client.query( "ALTER TABLE users ADD COLUMN IF NOT EXISTS referral_qualified_at TIMESTAMPTZ" ); await client.query(` UPDATE users SET referral_code='GTP' || upper(substr(md5(id::text || random()::text),1,10)) WHERE referral_code IS NULL `); await client.query( "CREATE UNIQUE INDEX IF NOT EXISTS users_referral_code_unique ON users(referral_code)" ); await client.query(` CREATE TABLE IF NOT EXISTS referral_reward_events ( id BIGSERIAL PRIMARY KEY, referrer_user_id BIGINT NOT NULL REFERENCES users(id) ON DELETE CASCADE, milestone INTEGER NOT NULL CHECK (milestone IN (15,50)), months_awarded INTEGER NOT NULL CHECK (months_awarded IN (1,2)), subscription_id BIGINT REFERENCES subscriptions(id) ON DELETE SET NULL, created_at TIMESTAMPTZ NOT NULL DEFAULT now(), UNIQUE(referrer_user_id,milestone) ) `); await client.query( "ALTER TABLE users ADD COLUMN IF NOT EXISTS vendor_verification TEXT NOT NULL DEFAULT 'not_submitted'" ); await client.query( "ALTER TABLE driver_documents ADD COLUMN IF NOT EXISTS encrypted_payload TEXT" ); await client.query( "ALTER TABLE driver_documents DROP CONSTRAINT IF EXISTS driver_documents_document_type_check" ); await client.query( "ALTER TABLE driver_documents ADD CONSTRAINT driver_documents_document_type_check CHECK (document_type IN ('aadhaar','vendor_aadhaar','driving_licence','vehicle_rc','vendor_gst','vendor_pan'))" ); await client.query(` CREATE TABLE IF NOT EXISTS membership_payment_requests ( id BIGSERIAL PRIMARY KEY, user_id BIGINT NOT NULL REFERENCES users(id) ON DELETE CASCADE, plan_months INTEGER NOT NULL CHECK (plan_months IN (1,3,6)), amount_rupees INTEGER NOT NULL CHECK (amount_rupees IN (51,151,301)), utr VARCHAR(40) NOT NULL UNIQUE, status TEXT NOT NULL DEFAULT 'pending' CHECK (status IN ('pending','approved','rejected')), admin_note TEXT, created_at TIMESTAMPTZ NOT NULL DEFAULT now(), reviewed_at TIMESTAMPTZ, reviewed_by TEXT ) `); await client.query(` CREATE TABLE IF NOT EXISTS admin_membership_overrides ( user_id BIGINT PRIMARY KEY REFERENCES users(id) ON DELETE CASCADE, status TEXT NOT NULL CHECK (status IN ('paid','unpaid')), note TEXT NOT NULL DEFAULT '', updated_at TIMESTAMPTZ NOT NULL DEFAULT now() ) `); await client.query("CREATE TABLE IF NOT EXISTS admin_notifications (id BIGSERIAL PRIMARY KEY, title TEXT NOT NULL, body TEXT NOT NULL, kind TEXT NOT NULL DEFAULT 'info', is_read BOOLEAN NOT NULL DEFAULT false, created_at TIMESTAMPTZ NOT NULL DEFAULT now())"); await client.query("COMMIT"); transactionOpen = false; databaseReady = true; console.log("Database schema initialized successfully. databaseReady=true"); } catch (error) { if (transactionOpen) { try { await client.query("ROLLBACK"); } catch (_) {} } throw error; } finally { client.release(); } } let dutyAutoBookingTimer = null;
 
 async function autoBookExpiredDuties() {
   if (!databaseReady) return 0;
@@ -3022,7 +3025,7 @@ async function autoBookExpiredDuties() {
     // One transaction-scoped lock prevents concurrent Render processes from duplicating the work.
     await client.query("SELECT pg_advisory_xact_lock($1)", [741029319]);
     const result = await client.query(
-      "UPDATE duties SET status='booked' " +
+      "UPDATE duties SET status='booked', auto_booked_at=now() " +
       "WHERE status IN ('open','accepted') " +
       "AND duty_date IS NOT NULL AND duty_time IS NOT NULL " +
       "AND (duty_date + duty_time) <= (now() AT TIME ZONE 'Asia/Kolkata') " +
@@ -3042,6 +3045,56 @@ async function autoBookExpiredDuties() {
   }
 }
 
+// Deletes only duties whose expiry scheduler set auto_booked_at.
+// The rule is origin-independent: WhatsApp and manually posted duties are treated equally.
+// Manually booked duties have a NULL marker and are never selected here.
+let lastAutoBookedDutyCleanupAt = 0;
+let autoBookedDutyCleanupPromise = null;
+async function cleanupAutoBookedDutiesIfDue() {
+  if (!databaseReady) return 0;
+  if (autoBookedDutyCleanupPromise) return autoBookedDutyCleanupPromise;
+  if (Date.now() - lastAutoBookedDutyCleanupAt < 24 * 60 * 60 * 1000) return 0;
+
+  autoBookedDutyCleanupPromise = (async () => {
+    const client = await pool.connect();
+    try {
+      await client.query("BEGIN");
+      // Prevent concurrent Render instances from running the cleanup together.
+      await client.query("SELECT pg_advisory_xact_lock($1)", [741029320]);
+      const result = await client.query(`
+        WITH old_duties AS (
+          SELECT id
+          FROM duties
+          WHERE status='booked'
+            AND auto_booked_at IS NOT NULL
+            AND auto_booked_at <= now() - INTERVAL '30 days'
+          ORDER BY auto_booked_at, id
+          LIMIT 1000
+          FOR UPDATE SKIP LOCKED
+        )
+        DELETE FROM duties d
+        USING old_duties old
+        WHERE d.id=old.id
+        RETURNING d.id
+      `);
+      await client.query("COMMIT");
+      lastAutoBookedDutyCleanupAt = Date.now();
+      if (result.rowCount > 0) {
+        console.log("Automatically expired duties older than 30 days deleted:", result.rowCount);
+      }
+      return result.rowCount;
+    } catch (error) {
+      await client.query("ROLLBACK").catch(() => {});
+      throw error;
+    } finally {
+      client.release();
+    }
+  })().finally(() => {
+    autoBookedDutyCleanupPromise = null;
+  });
+  return autoBookedDutyCleanupPromise;
+}
+
 let dutyExpiryOnDemandPromise = null;
 let lastDutyExpiryOnDemandCheckAt = 0;
 
@@ -3059,10 +3112,13 @@ async function ensureExpiredDutiesBooked() {
 
 function startDutyAutoBookingScheduler() {
   if (dutyAutoBookingTimer) return;
-  const run = () => {
-    autoBookExpiredDuties().catch((error) => {
-      console.error("Automatic duty booking check failed:", error.message);
-    });
+  const run = async () => {
+    try {
+      await autoBookExpiredDuties();
+      await cleanupAutoBookedDutiesIfDue();
+    } catch (error) {
+      console.error("Automatic duty booking/cleanup check failed:", error.message);
+    }
   };
   run();
   dutyAutoBookingTimer = setInterval(run, 60 * 1000);
