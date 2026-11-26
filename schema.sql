@@ -185,9 +185,9 @@ CREATE TABLE IF NOT EXISTS membership_global_reset_events (
   affected_overrides INTEGER NOT NULL DEFAULT 0,
   created_at TIMESTAMPTZ NOT NULL DEFAULT now()
 );
-INSERT INTO membership_global_reset_events(event_key,scheduled_at)
-VALUES('all-users-unpaid-2026-11-30-2345-ist','2026-11-30T18:15:00Z'::timestamptz)
-ON CONFLICT(event_key) DO NOTHING;
+-- The former timed Nov 30 reset is intentionally not scheduled; Admin now controls UNPAID ALL.
+DELETE FROM membership_global_reset_events
+WHERE event_key='all-users-unpaid-2026-11-30-2345-ist' AND executed_at IS NULL;
 
 
 -- Gudiya Taxi Partner feature additions (additive / non-destructive)
