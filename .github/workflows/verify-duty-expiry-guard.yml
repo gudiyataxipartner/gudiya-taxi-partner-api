@@ -1,0 +1,30 @@
+name: Verify Duty Expiry Guard
+on:
+  push:
+    branches: [main]
+    paths:
+      - "src/server.js"
+      - ".github/workflows/verify-duty-expiry-guard.yml"
+  workflow_dispatch:
+permissions:
+  contents: read
+jobs:
+  verify:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-node@v4
+        with:
+          node-version: "22"
+      - name: Check JavaScript syntax
+        run: node --check src/server.js
+      - name: Check expiry safety guards
+        shell: bash
+        run: |
+          set -euo pipefail
+          grep -Fq "async function ensureExpiredDutiesBooked()" src/server.js
+          grep -Fq 'await ensureExpiredDutiesBooked();' src/server.js
+          grep -Fq "(d.duty_date + d.duty_time) <= (now() AT TIME ZONE 'Asia/Kolkata')" src/server.js
+          grep -Fq "AS is_expired" src/server.js
+          grep -Fq "ड्यूटी का निर्धारित समय निकल चुका है" src/server.js
+          echo "Duty expiry guards verified."
