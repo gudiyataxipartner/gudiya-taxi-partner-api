@@ -60,6 +60,7 @@ async function ensureWhatsAppDutySchema() {
         await client.query("ALTER TABLE duties ADD COLUMN IF NOT EXISTS source_poster_phone TEXT");
         await client.query("ALTER TABLE duties ADD COLUMN IF NOT EXISTS source_message_hash TEXT");
         await client.query("CREATE UNIQUE INDEX IF NOT EXISTS duties_source_message_hash_unique ON duties(source_message_hash) WHERE source_message_hash IS NOT NULL");
+        await client.query("CREATE INDEX IF NOT EXISTS duties_whatsapp_missing_date_autobook_idx ON duties(created_at,id) WHERE source_type='whatsapp' AND duty_date IS NULL AND status IN ('open','accepted')");
         await client.query("COMMIT");
       } catch (error) {
         try { await client.query("ROLLBACK"); } catch (_) {}
@@ -3291,14 +3292,16 @@ async function autoBookExpiredDuties() {
     await client.query("SELECT pg_advisory_xact_lock($1)", [741029319]);
     const result = await client.query(
       "UPDATE duties SET status='booked', auto_booked_at=now() " +
-      "WHERE status IN ('open','accepted') " +
-      "AND duty_date IS NOT NULL AND duty_time IS NOT NULL " +
-      "AND (duty_date + duty_time) <= (now() AT TIME ZONE 'Asia/Kolkata') " +
-      "RETURNING id"
+      "WHERE status IN ('open','accepted') AND (" +
+      "(duty_date IS NOT NULL AND duty_time IS NOT NULL " +
+      "AND (duty_date + duty_time) <= (now() AT TIME ZONE 'Asia/Kolkata')) " +
+      "OR (source_type='whatsapp' AND duty_date IS NULL " +
+      "AND created_at <= now() - INTERVAL '48 hours')) " +
+      "RETURNING id, source_type, duty_date"
     );
     await client.query("COMMIT");
     if (result.rowCount > 0) {
-      console.log("Automatically marked expired duties as booked:", result.rowCount);
+      console.log("Automatically marked expired/date-missing WhatsApp duties as booked:", result.rowCount);
       broadcastDutyUpdate();
     }
     return result.rowCount;
