@@ -211,15 +211,23 @@ async function getPublishedAppVersionInfo() {
     });
     if (!response.ok) throw new Error("Latest app release is temporarily unavailable");
     const release = await response.json();
-    const body = String(release.body || "");
-    const versionMatch = body.match(/^\\s*Version:\\s*(\\d+(?:\\.\\d+){1,3})\\s*$/im);
-    const minimumMatch = body.match(/^\\s*Minimum supported version:\\s*(\\d+(?:\\.\\d+){1,3})\\s*$/im);
-    const latestVersion = versionMatch?.[1] || "";
-    const minimumSupportedVersion = minimumMatch?.[1] || latestVersion;
+    const releaseLines = String(release.body || "").split("\\n").map((line) => line.trim());
+    const getReleaseField = (label) => {
+      const prefix = label.toLowerCase();
+      const line = releaseLines.find((item) => item.toLowerCase().startsWith(prefix));
+      return line ? line.slice(label.length).trim() : "";
+    };
+    const latestVersion = getReleaseField("Version:");
+    const minimumSupportedVersion = getReleaseField("Minimum supported version:") || latestVersion;
+    const isValidVersion = (value) => {
+      const parts = String(value || "").split(".");
+      return parts.length >= 2 && parts.length <= 4 &&
+        parts.every((part) => part !== "" && Number.isSafeInteger(Number(part)) && Number(part) >= 0);
+    };
     const apk = Array.isArray(release.assets)
       ? release.assets.find((asset) => asset.name === "gudiya-taxi-partner.apk")
       : null;
-    if (!latestVersion || !minimumSupportedVersion || !apk?.browser_download_url) {
+    if (!isValidVersion(latestVersion) || !isValidVersion(minimumSupportedVersion) || !apk?.browser_download_url) {
       throw new Error("Latest app release metadata is incomplete");
     }
     const result = {
