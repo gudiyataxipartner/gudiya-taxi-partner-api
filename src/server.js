@@ -128,6 +128,8 @@ async function sendPushToUserIds(userIds, title, body, extraData = {}) {
         Object.entries({ title, body, ...extraData }).map(([key, value]) => [key, String(value ?? "")])
       );
       const result = await firebaseMessaging.sendEachForMulticast({
+        // Attach the target device tokens to this multicast request.
+        tokens: batch,
         // Notification payload lets Android display it while the app is in the background.
         // Data is retained for app-side handling while the app is in the foreground.
         notification: { title: String(title), body: String(body) },
