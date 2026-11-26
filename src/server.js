@@ -1755,6 +1755,7 @@ app.post("/api/duties/:id/accept", requireAuth, async (req, res, next) => {
       return res
         .status(403)
         .json({ error: "ड्यूटी स्वीकार करने के लिए ड्राइवर अकाउंट जरूरी है" });
+    await ensureExpiredDutiesBooked();
     // Enforce the same membership/five-minute access policy on the server.
     // Hiding the Accept button in the app alone is not a security boundary.
     const activeMembership = await hasActiveMembership(req.auth.user_id);
