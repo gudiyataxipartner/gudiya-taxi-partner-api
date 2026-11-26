@@ -2544,6 +2544,67 @@ app.post("/api/admin/membership/unpaid-all", requireAdmin, async (req, res, next
   }
 });
 
+
+// Admin can grant a time-bounded membership to every existing account.
+// This is the inverse of UNPAID ALL and never alters users, duties, or documents.
+app.post("/api/admin/membership/paid-all", requireAdmin, async (req, res, next) => {
+  const months = Number(req.body?.months);
+  if (!Number.isInteger(months) || ![1, 3, 6].includes(months)) {
+    return res.status(400).json({ error: "PAID ALL के लिए 1, 3 या 6 महीने चुनें।" });
+  }
+  const note = String(req.body?.note || "Admin PAID ALL").trim().slice(0, 500);
+  const client = await pool.connect();
+  try {
+    await client.query("BEGIN");
+    // Serialize with UNPAID ALL so simultaneous bulk actions cannot cross over.
+    await client.query("SELECT pg_advisory_xact_lock($1)", [741029321]);
+    const granted = await client.query(
+      `INSERT INTO subscriptions
+         (user_id,provider,plan_months,amount_rupees,status,current_period_end)
+       SELECT u.id,'admin_extension',$1::integer,NULL,'active',
+         GREATEST(
+           now(),
+           COALESCE((
+             SELECT MAX(s.current_period_end)
+               FROM subscriptions s
+              WHERE s.user_id=u.id
+                AND lower(trim(s.status))='active'
+                AND s.current_period_end>now()
+           ),now())
+         ) + ($1::integer * interval '1 month')
+       FROM users u`,
+      [months]
+    );
+    const clearedOverrides = await client.query(
+      "DELETE FROM admin_membership_overrides RETURNING user_id"
+    );
+    await client.query(
+      `INSERT INTO audit_log(action,subject_type,subject_id,details)
+       VALUES('global_membership_paid','membership','all-users',$1)`,
+      [JSON.stringify({
+        months,
+        usersPaid: granted.rowCount,
+        overridesCleared: clearedOverrides.rowCount,
+        note,
+        admin: req.admin?.username || "admin-api-key"
+      })]
+    );
+    await client.query("COMMIT");
+    return res.json({
+      ok: true,
+      months,
+      usersPaid: granted.rowCount,
+      overridesCleared: clearedOverrides.rowCount,
+      message: "सभी " + granted.rowCount + " Users को " + months + " महीने के लिए Paid कर दिया गया। किसी का account, document या duty delete नहीं हुआ।"
+    });
+  } catch (error) {
+    await client.query("ROLLBACK").catch(() => {});
+    next(error);
+  } finally {
+    client.release();
+  }
+});
+
 app.get(
   "/api/admin/membership/payments/pending",
   requireAdmin,
@@ -2775,14 +2836,14 @@ app.get("/api/admin/users", requireAdmin, async (req, res, next) => {
         CASE WHEN EXISTS(SELECT 1 FROM device_sessions ds WHERE ds.user_id=u.id AND ds.revoked_at IS NULL
           AND ds.last_seen_at>now()-interval '30 days') THEN 'active' ELSE 'inactive' END AS login_status
       FROM users u LEFT JOIN admin_membership_overrides o ON o.user_id=u.id
-      WHERE ($1='' OR u.name ILIKE '%'||$1||'%' OR u.phone ILIKE '%'||$1||'%' OR u.id::text=$1)
-        AND ($2='all' OR u.role_mode=$2)
-        AND ($3='all' OR (CASE WHEN o.status IS NOT NULL THEN o.status
+      WHERE ($1::text='' OR u.name::text ILIKE '%'||$1::text||'%' OR u.phone::text ILIKE '%'||$1::text||'%' OR u.id::text=$1::text)
+        AND ($2::text='all' OR u.role_mode::text=$2::text)
+        AND ($3::text='all' OR (CASE WHEN o.status IS NOT NULL THEN o.status::text
           WHEN EXISTS(SELECT 1 FROM subscriptions s WHERE s.user_id=u.id AND s.status='active'
-            AND s.current_period_end>now() AND (s.provider='referral_reward' OR s.provider='admin_extension' OR (s.provider='manual_upi' AND s.provider_payment_id IS NOT NULL))) THEN 'paid' ELSE 'unpaid' END)=$3)
-        AND ($4='all' OR (CASE WHEN EXISTS(SELECT 1 FROM device_sessions ds WHERE ds.user_id=u.id
-          AND ds.revoked_at IS NULL AND ds.last_seen_at>now()-interval '30 days') THEN 'active' ELSE 'inactive' END)=$4)
-        AND ($5='all' OR u.driver_verification=$5 OR u.vendor_verification=$5)
+            AND s.current_period_end>now() AND (s.provider='referral_reward' OR s.provider='admin_extension' OR (s.provider='manual_upi' AND s.provider_payment_id IS NOT NULL))) THEN 'paid' ELSE 'unpaid' END)::text=$3::text)
+        AND ($4::text='all' OR (CASE WHEN EXISTS(SELECT 1 FROM device_sessions ds WHERE ds.user_id=u.id
+          AND ds.revoked_at IS NULL AND ds.last_seen_at>now()-interval '30 days') THEN 'active' ELSE 'inactive' END)::text=$4::text)
+        AND ($5::text='all' OR u.driver_verification::text=$5::text OR u.vendor_verification::text=$5::text)
       ORDER BY u.created_at DESC LIMIT 500`,
       [q, role, membership, activity, verification]
     );
@@ -3182,7 +3243,22 @@ app.get("/api/admin/duty-reports",requireAdmin,async(req,res,next)=>{try{const s
 app.post("/api/admin/duty-reports/:id/review",requireAdmin,async(req,res,next)=>{try{if(!/^\d+$/.test(String(req.params.id)))return res.status(400).json({error:"Invalid report ID"});const status=String(req.body.status||"");if(!["reviewed","dismissed","actioned"].includes(status))return res.status(400).json({error:"Invalid report status"});const r=await pool.query("UPDATE duty_reports SET status=$1,admin_note=$2,reviewed_at=now(),reviewed_by=$3 WHERE id=$4 RETURNING id,status",[status,String(req.body.note||"").slice(0,1000),req.admin?.username||"admin",req.params.id]);if(!r.rowCount)return res.status(404).json({error:"Report not found"});res.json({ok:true,report:r.rows[0]});}catch(e){next(e);}});
 app.post("/api/admin/duties/:id/featured",requireAdmin,async(req,res,next)=>{try{if(!/^\d+$/.test(String(req.params.id)))return res.status(400).json({error:"Invalid duty ID"});const r=await pool.query("UPDATE duties SET is_featured=$1 WHERE id=$2 RETURNING id,is_featured",[req.body.featured===true,req.params.id]);if(!r.rowCount)return res.status(404).json({error:"Duty not found"});broadcastDutyUpdate();res.json({ok:true,duty:r.rows[0]});}catch(e){next(e);}});
 
-app.use((err, _req, res, _next) => { console.error(err.message); const status = Number(err.status) || 500; res .status(status) .json({ error: status < 500 ? err.message : "Server error" }); });
+app.use((err, req, res, _next) => {
+  const status = Number(err.status) || 500;
+  // Keep SQL diagnostics in Render logs without exposing query values to the client.
+  console.error("API request failed:", JSON.stringify({
+    method: req.method,
+    path: req.path,
+    status,
+    code: err.code || null,
+    message: err.message || "Unknown error",
+    detail: err.detail || null,
+    hint: err.hint || null,
+    position: err.position || null,
+    routine: err.routine || null
+  }));
+  res.status(status).json({ error: status < 500 ? err.message : "Server error" });
+});
 
 // Bootstrap the complete schema before accepting requests.
 // Serialize startup migrations across overlapping Render instances to prevent DDL deadlocks.
