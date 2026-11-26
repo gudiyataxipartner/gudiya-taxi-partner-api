@@ -1263,7 +1263,7 @@ app.get("/api/admin/whatsapp-duties", requireAdmin, async (req,res,next) => {
     await ensureWhatsAppInboxSchema();
     const status = ["pending","published","ignored"].includes(String(req.query.status||"")) ? String(req.query.status) : "pending";
     const r = await pool.query(`SELECT id,group_name,sender_name,sender_phone,message_text,status,duty_id,created_at
-      FROM admin_whatsapp_duties WHERE status=$1 ORDER BY created_at DESC LIMIT 200`,[status]);
+      FROM admin_whatsapp_duties WHERE status=$1 ORDER BY created_at DESC LIMIT 500`,[status]);
     res.json({duties:r.rows});
   } catch(e) { next(e); }
 });
