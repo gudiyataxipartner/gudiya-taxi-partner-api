@@ -1,0 +1,39 @@
+name: Verify Admin App Update Endpoint
+on:
+  push:
+    branches: [main]
+    paths:
+      - "src/server.js"
+      - ".github/workflows/verify-admin-app-version-endpoint.yml"
+  workflow_dispatch:
+permissions:
+  contents: read
+jobs:
+  verify:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Verify live Admin update metadata
+        shell: bash
+        run: |
+          set -euo pipefail
+          URL="https://gudiya-taxi-partner-api-1.onrender.com/api/admin/app-version"
+          for attempt in $(seq 1 24); do
+            if curl --silent --show-error --fail --max-time 10 "$URL" -o /tmp/admin-version.json; then
+              break
+            fi
+            if [ "$attempt" -eq 24 ]; then
+              echo "Admin app update endpoint did not become available."
+              exit 1
+            fi
+            sleep 10
+          done
+          python3 - <<'PY'
+          import json
+          from pathlib import Path
+          data=json.loads(Path("/tmp/admin-version.json").read_text())
+          print("Latest Admin version:",data.get("latestVersion"))
+          print("Admin APK URL:",data.get("apkUrl"))
+          assert data.get("latestVersion") == "1.1.10", "Latest Admin version mismatch"
+          assert data.get("apkUrl","").startswith("https://github.com/gudiyataxipartner/gudiya-taxi-partner-admin/releases/download/admin-v1.1.10/"), "Admin APK URL mismatch"
+          print("Live Admin update endpoint verified.")
+          PY
