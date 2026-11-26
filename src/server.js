@@ -1245,6 +1245,13 @@ app.post("/api/admin/whatsapp-duties/:id/publish", requireAdmin, async(req,res,n
       await client.query("ROLLBACK"); transactionOpen = false;
       return res.status(404).json({error:"Pending WhatsApp duty not found"});
     }
+    // A WhatsApp sender's own number is not proof of the duty's contact number.
+    // Only a valid mobile explicitly present in the duty message may be published.
+    const contactPhone = extractIndianMobile(inbox.rows[0].message_text);
+    if (!contactPhone) {
+      await client.query("ROLLBACK"); transactionOpen = false;
+      return res.status(422).json({error:"ड्यूटी के WhatsApp संदेश में संपर्क मोबाइल नंबर नहीं है। यह ड्यूटी Publish नहीं की गई।"});
+    }
     const vendor = await client.query(
       "SELECT id FROM users WHERE right(regexp_replace(COALESCE(phone,''),'[^0-9]','','g'),10)=$1 AND role_mode IN ('vendor','both') LIMIT 2",
       [vendorPhone]
@@ -1255,7 +1262,7 @@ app.post("/api/admin/whatsapp-duties/:id/publish", requireAdmin, async(req,res,n
     }
     const duty = await client.query(`INSERT INTO duties(user_id,role_posted_as,pickup_city,drop_city,vehicle_type,trip_type,duty_date,duty_time,payout_paise,notes_private,distance_label,source_type,source_group,source_poster_name,source_poster_phone)
       VALUES($1,'vendor',$2,$3,$4,$5,$6,$7,$8,$9,'लगभग दूरी','whatsapp',$10,$11,$12) RETURNING id`,
-      [vendor.rows[0].id,pickup,drop,vehicle,trip,dutyDate,dutyTime || null,payout,String(inbox.rows[0].message_text).slice(0,1000),inbox.rows[0].group_name,inbox.rows[0].sender_name,(inbox.rows[0].sender_phone || extractIndianMobile(inbox.rows[0].message_text))]);
+      [vendor.rows[0].id,pickup,drop,vehicle,trip,dutyDate,dutyTime || null,payout,String(inbox.rows[0].message_text).slice(0,1000),inbox.rows[0].group_name,inbox.rows[0].sender_name,contactPhone]);
     await client.query("UPDATE admin_whatsapp_duties SET status='published',duty_id=$2,reviewed_at=now() WHERE id=$1",[id,duty.rows[0].id]);
     await client.query("INSERT INTO audit_log(action,subject_type,subject_id,details) VALUES('whatsapp_duty_published','duty',$1,$2)",
       [String(duty.rows[0].id),JSON.stringify({inboxId:id,admin:req.admin?.username || "admin"})]);
@@ -1281,11 +1288,10 @@ app.post("/api/duties/import/whatsapp", requireAuth, async (req, res, next) => {
     await ensureWhatsAppDutySchema();
     const groupName = String(req.body.groupName || "").trim().slice(0, 180);
     const senderName = String(req.body.senderName || "").trim().slice(0, 180);
-    const senderPhoneRaw = String(req.body.senderPhone || "").replace(/\D/g, "");
-    const senderPhoneCandidate = /^[6-9]\d{9}$/.test(senderPhoneRaw) ? senderPhoneRaw : null;
     const message = String(req.body.message || "").trim().slice(0, 5000);
-    const senderPhone = senderPhoneCandidate || extractIndianMobile(message);
+    const contactPhone = extractIndianMobile(message);
     if (!groupName || !message) return res.status(400).json({ error: "WhatsApp group and message are required" });
+    if (!contactPhone) return res.status(422).json({ ignored: true, reason: "Duty contact mobile number is missing; duty was not published" });
     // Ignore messages that do not look like a duty. Parsing is intentionally conservative.
     const routeLine = message.split(/\r?\n/).map(line => line.trim()).find(line => /\bto\b|से|→|➜/i.test(line));
     let routeMatch = null;
@@ -1325,7 +1331,7 @@ app.post("/api/duties/import/whatsapp", requireAuth, async (req, res, next) => {
     const inserted = await pool.query(`INSERT INTO duties(user_id,role_posted_as,pickup_city,drop_city,vehicle_type,trip_type,duty_date,duty_time,payout_paise,notes_private,distance_label,source_type,source_group,source_poster_name,source_poster_phone,source_message_hash)
       VALUES($1,'vendor',$2,$3,$4,$5,$6,$7,$8,$9,'लगभग दूरी','whatsapp',$10,$11,$12,$13)
       ON CONFLICT (source_message_hash) WHERE source_message_hash IS NOT NULL DO NOTHING RETURNING id,created_at,status`,
-      [req.auth.user_id,pickup,drop,vehicle,tripType,dutyDate,dutyTime,payout,message,groupName,senderName||null,senderPhone,hash]);
+      [req.auth.user_id,pickup,drop,vehicle,tripType,dutyDate,dutyTime,payout,message,groupName,senderName||null,contactPhone,hash]);
     if (!inserted.rowCount) return res.json({ ok:true, duplicate:true, imported:false });
     broadcastDutyUpdate();
     const recipients = await pool.query("SELECT id FROM users WHERE id<>$1 AND (role_mode='driver' OR role_mode='both')", [req.auth.user_id]);
