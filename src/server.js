@@ -2151,7 +2151,7 @@ app.post(
   rateLimit({ windowMs: 60 * 60_000, limit: 8 }),
   async (req, res, next) => {
     try {
-      const months = Number(req.body.months);
+      const months = req.body.months == null ? 1 : Number(req.body.months);
       const amount = UPI_PLANS[months];
       const utr = String(req.body.utr || "")
         .trim()
