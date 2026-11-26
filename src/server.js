@@ -3154,12 +3154,10 @@ async function runScheduledMembershipResets() {
          RETURNING id`,
         [scheduledAt]
       );
+      // Remove only pre-reset Paid overrides. With subscriptions expired above,
+      // those accounts now fall back to Unpaid. Existing explicit Unpaid overrides remain.
       const unpaidOverrides = await client.query(
-        `UPDATE admin_membership_overrides
-           SET status='unpaid',
-               note=CASE WHEN trim(note)='' THEN 'Automatic all-user unpaid reset: 30 November 2026, 11:45 PM IST'
-                         ELSE left(note || ' | Automatic all-user unpaid reset: 30 November 2026, 11:45 PM IST',500) END,
-               updated_at=now()
+        `DELETE FROM admin_membership_overrides
          WHERE status='paid' AND updated_at <= $1
          RETURNING user_id`,
         [scheduledAt]
