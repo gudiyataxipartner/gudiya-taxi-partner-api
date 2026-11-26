@@ -1,0 +1,42 @@
+name: Verify Android App Version Endpoint
+on:
+  push:
+    branches: [main]
+    paths:
+      - "src/server.js"
+      - ".github/workflows/verify-app-version-endpoint.yml"
+  workflow_dispatch:
+permissions:
+  contents: read
+jobs:
+  verify:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Wait for Render app version endpoint
+        shell: bash
+        run: |
+          set -euo pipefail
+          URL="https://gudiya-taxi-partner-api-1.onrender.com/api/app-version"
+          for attempt in $(seq 1 24); do
+            if curl --silent --show-error --fail --max-time 10 "$URL" -o /tmp/app-version.json; then
+              break
+            fi
+            if [ "$attempt" -eq 24 ]; then
+              echo "App version endpoint did not become available."
+              exit 1
+            fi
+            sleep 10
+          done
+          python3 - <<'PY'
+          import json
+          from pathlib import Path
+          d=json.loads(Path("/tmp/app-version.json").read_text())
+          print("Latest version:",d.get("latestVersion"))
+          print("Minimum supported:",d.get("minimumSupportedVersion"))
+          print("APK URL:",d.get("apkUrl"))
+          assert d.get("latestVersion"), "latestVersion missing"
+          assert d.get("minimumSupportedVersion"), "minimumSupportedVersion missing"
+          assert d.get("apkUrl","").startswith("https://github.com/"), "APK download URL missing"
+          assert d.get("minimumSupportedVersion") == "1.3.6", "Minimum supported version does not match current initial gate release"
+          print("Android app version endpoint verified.")
+          PY
