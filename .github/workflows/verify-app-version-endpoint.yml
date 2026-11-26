@@ -35,7 +35,7 @@ jobs:
           print("Minimum supported:",d.get("minimumSupportedVersion"))
           print("APK URL:",d.get("apkUrl"))
           import re
-          version_re = re.compile(r"^\\d+(?:\\.\\d+){1,3}$")
+          version_re = re.compile(r"^\d+(?:\.\d+){1,3}$")
           assert version_re.fullmatch(str(d.get("latestVersion") or "")), "latestVersion invalid"
           assert version_re.fullmatch(str(d.get("minimumSupportedVersion") or "")), "minimumSupportedVersion invalid"
           assert d.get("apkUrl","").startswith("https://github.com/gudiyataxipartner/gudiya-taxi-partner/releases/download/"), "APK download URL missing or unexpected"
