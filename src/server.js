@@ -1245,9 +1245,11 @@ app.post("/api/admin/whatsapp-duties/:id/publish", requireAdmin, async(req,res,n
       await client.query("ROLLBACK"); transactionOpen = false;
       return res.status(404).json({error:"Pending WhatsApp duty not found"});
     }
-    // A WhatsApp sender's own number is not proof of the duty's contact number.
-    // Only a valid mobile explicitly present in the duty message may be published.
-    const contactPhone = extractIndianMobile(inbox.rows[0].message_text);
+    // Either the message's listed contact number OR the WhatsApp sender's
+    // mobile number is acceptable as the duty contact number.
+    const contactPhone =
+      extractIndianMobile(inbox.rows[0].message_text) ||
+      extractIndianMobile(inbox.rows[0].sender_phone);
     if (!contactPhone) {
       await client.query("ROLLBACK"); transactionOpen = false;
       return res.status(422).json({error:"ड्यूटी के WhatsApp संदेश में संपर्क मोबाइल नंबर नहीं है। यह ड्यूटी Publish नहीं की गई।"});
@@ -1289,7 +1291,8 @@ app.post("/api/duties/import/whatsapp", requireAuth, async (req, res, next) => {
     const groupName = String(req.body.groupName || "").trim().slice(0, 180);
     const senderName = String(req.body.senderName || "").trim().slice(0, 180);
     const message = String(req.body.message || "").trim().slice(0, 5000);
-    const contactPhone = extractIndianMobile(message);
+    const contactPhone =
+      extractIndianMobile(message) || extractIndianMobile(req.body.senderPhone);
     if (!groupName || !message) return res.status(400).json({ error: "WhatsApp group and message are required" });
     if (!contactPhone) return res.status(422).json({ ignored: true, reason: "Duty contact mobile number is missing; duty was not published" });
     // Ignore messages that do not look like a duty. Parsing is intentionally conservative.
