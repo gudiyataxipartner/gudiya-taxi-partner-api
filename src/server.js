@@ -1317,10 +1317,11 @@ app.post("/api/admin/whatsapp-duties/:id/publish", requireAdmin, async(req,res,n
     }
     // Either the message's listed contact number OR the WhatsApp sender's
     // mobile number is acceptable as the duty contact number.
+    // The admin-reviewed number takes precedence; all sources are normalized and validated.
     const contactPhone =
+      extractIndianMobile(b.contactPhone) ||
       extractIndianMobile(inbox.rows[0].message_text) ||
-      extractIndianMobile(inbox.rows[0].sender_phone) ||
-      extractIndianMobile(b.contactPhone);
+      extractIndianMobile(inbox.rows[0].sender_phone);
     if (!contactPhone) {
       await client.query("ROLLBACK"); transactionOpen = false;
       return res.status(422).json({error:"ड्यूटी के WhatsApp संदेश में संपर्क मोबाइल नंबर नहीं है। यह ड्यूटी Publish नहीं की गई।"});
