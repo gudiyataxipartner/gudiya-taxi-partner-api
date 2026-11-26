@@ -34,7 +34,7 @@ jobs:
           print("Latest Admin version:",data.get("latestVersion"))
           print("Admin APK URL:",data.get("apkUrl"))
           import re
-          version_re = re.compile(r"^\\d+(?:\\.\\d+){1,3}$")
+          version_re = re.compile(r"^\d+(?:\.\d+){1,3}$")
           version = str(data.get("latestVersion") or "")
           apk_url = str(data.get("apkUrl") or "")
           assert version_re.fullmatch(version), "Latest Admin version missing or invalid"
