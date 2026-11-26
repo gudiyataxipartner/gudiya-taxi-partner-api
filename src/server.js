@@ -260,6 +260,68 @@ app.get("/api/app-version", async (_req, res) => {
   }
 });
 
+// Public version metadata for the Admin Android app update prompt.
+// The endpoint only exposes the latest published Admin APK release information.
+const GUDIYA_ADMIN_LATEST_RELEASE_API =
+  "https://api.github.com/repos/gudiyataxipartner/gudiya-taxi-partner-admin/releases/latest";
+let adminReleaseCache = null;
+let adminReleaseCacheUntil = 0;
+let adminReleaseFetchInFlight = null;
+
+async function getPublishedAdminAppVersionInfo() {
+  if (adminReleaseCache && Date.now() < adminReleaseCacheUntil) return adminReleaseCache;
+  if (adminReleaseFetchInFlight) return adminReleaseFetchInFlight;
+  adminReleaseFetchInFlight = (async () => {
+    const response = await fetch(GUDIYA_ADMIN_LATEST_RELEASE_API, {
+      headers: {
+        Accept: "application/vnd.github+json",
+        "User-Agent": "Gudiya-Taxi-Partner-Admin-Android-App",
+      },
+      signal: AbortSignal.timeout(7000),
+    });
+    if (!response.ok) throw new Error("Latest Admin app release is temporarily unavailable");
+    const release = await response.json();
+    const releaseLines = String(release.body || "").split(String.fromCharCode(10)).map(line => line.trim());
+    const versionLine = releaseLines.find(line => line.toLowerCase().startsWith("version:"));
+    const latestVersion = versionLine ? versionLine.slice("Version:".length).trim() : "";
+    const parts = latestVersion.split(".");
+    const validVersion = parts.length >= 2 && parts.length <= 4 &&
+      parts.every(part => part !== "" && Number.isSafeInteger(Number(part)) && Number(part) >= 0);
+    const apk = Array.isArray(release.assets)
+      ? release.assets.find(asset => asset.name === "Gudiya-Taxi-Partner-Admin-release.apk")
+      : null;
+    if (!validVersion || !apk?.browser_download_url ||
+        !String(apk.browser_download_url).startsWith("https://github.com/")) {
+      throw new Error("Latest Admin app release metadata is incomplete");
+    }
+    const result = {
+      latestVersion,
+      apkUrl: apk.browser_download_url,
+      releaseUrl: String(release.html_url || "https://github.com/gudiyataxipartner/gudiya-taxi-partner-admin/releases/latest"),
+    };
+    adminReleaseCache = result;
+    adminReleaseCacheUntil = Date.now() + 5 * 60 * 1000;
+    return result;
+  })();
+  try {
+    return await adminReleaseFetchInFlight;
+  } finally {
+    adminReleaseFetchInFlight = null;
+  }
+}
+
+app.get("/api/admin/app-version", async (_req, res) => {
+  try {
+    const info = await getPublishedAdminAppVersionInfo();
+    return res.set("Cache-Control", "public, max-age=60, stale-while-revalidate=240").json(info);
+  } catch (error) {
+    console.error("Admin Android app version check failed:", error.message);
+    return res.status(503).set("Cache-Control", "no-store").json({
+      error: "Admin app update information is temporarily unavailable",
+    });
+  }
+});
+
 function requireConfig() {
   if (!process.env.JWT_SECRET || process.env.JWT_SECRET.length < 32)
     throw new Error(
