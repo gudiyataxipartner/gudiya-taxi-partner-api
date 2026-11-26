@@ -823,6 +823,12 @@ function cleanWhatsAppPosterName(value) {
   return name || null;
 }
 
+function getWhatsAppPosterName(value, groupName) {
+  const name = cleanWhatsAppPosterName(value);
+  const group = String(groupName || "").trim();
+  if (!name || (group && name.toLocaleLowerCase() === group.toLocaleLowerCase())) return null;
+  return name.slice(0, 180);
+}
 function privateDuty(d) {
   return {
     id: d.id,
@@ -1397,8 +1403,8 @@ app.post("/api/admin/whatsapp-duties/:id/publish", requireAdmin, async(req,res,n
       return res.status(409).json({error:"WHATSAPP_VENDOR_PHONE does not match exactly one Vendor/Both account"});
     }
     const duty = await client.query(`INSERT INTO duties(user_id,role_posted_as,pickup_city,drop_city,vehicle_type,trip_type,duty_date,duty_time,payout_paise,notes_private,distance_label,source_type,source_group,source_poster_name,source_poster_phone)
-      VALUES($1,'vendor',$2,$3,$4,$5,$6,$7,$8,$9,'लगभग दूरी','whatsapp',$10,$11,$12) RETURNING id`,
-      [vendor.rows[0].id,pickup,drop,vehicle,trip,dutyDate,dutyTime || null,payout,String(inbox.rows[0].message_text).slice(0,1000),inbox.rows[0].group_name,inbox.rows[0].sender_name,contactPhone]);
+      VALUES($1,'vendor',$2,$3,$4,$5,$6,$7,$8,$9,'लगभग दूरी','whatsapp',NULL,$10,$11) RETURNING id`,
+      [vendor.rows[0].id,pickup,drop,vehicle,trip,dutyDate,dutyTime || null,payout,String(inbox.rows[0].message_text).slice(0,1000),getWhatsAppPosterName(inbox.rows[0].sender_name,inbox.rows[0].group_name),contactPhone]);
     await client.query("UPDATE admin_whatsapp_duties SET status='published',duty_id=$2,reviewed_at=now() WHERE id=$1",[id,duty.rows[0].id]);
     await client.query("INSERT INTO audit_log(action,subject_type,subject_id,details) VALUES('whatsapp_duty_published','duty',$1,$2)",
       [String(duty.rows[0].id),JSON.stringify({inboxId:id,admin:req.admin?.username || "admin"})]);
@@ -1466,9 +1472,9 @@ app.post("/api/duties/import/whatsapp", requireAuth, async (req, res, next) => {
     if(timeMatch){let h=Number(timeMatch[1]),m=Number(timeMatch[2]);const ap=(timeMatch[3]||"").toUpperCase();if(m<60&&h<=12){if(ap==="PM"&&h<12)h+=12;if(ap==="AM"&&h===12)h=0;dutyTime=`${String(h).padStart(2,"0")}:${String(m).padStart(2,"0")}:00`;}}
     const hash = crypto.createHash("sha256").update(`${groupName.toLowerCase()}|${senderName.toLowerCase()}|${message.toLowerCase().replace(/\s+/g," ").trim()}`).digest("hex");
     const inserted = await pool.query(`INSERT INTO duties(user_id,role_posted_as,pickup_city,drop_city,vehicle_type,trip_type,duty_date,duty_time,payout_paise,notes_private,distance_label,source_type,source_group,source_poster_name,source_poster_phone,source_message_hash)
-      VALUES($1,'vendor',$2,$3,$4,$5,$6,$7,$8,$9,'लगभग दूरी','whatsapp',$10,$11,$12,$13)
+      VALUES($1,'vendor',$2,$3,$4,$5,$6,$7,$8,$9,'लगभग दूरी','whatsapp',NULL,$10,$11,$12)
       ON CONFLICT (source_message_hash) WHERE source_message_hash IS NOT NULL DO NOTHING RETURNING id,created_at,status`,
-      [req.auth.user_id,pickup,drop,vehicle,tripType,dutyDate,dutyTime,payout,message,groupName,senderName||null,contactPhone,hash]);
+      [req.auth.user_id,pickup,drop,vehicle,tripType,dutyDate,dutyTime,payout,message,getWhatsAppPosterName(senderName,groupName),contactPhone,hash]);
     if (!inserted.rowCount) return res.json({ ok:true, duplicate:true, imported:false });
     broadcastDutyUpdate();
     const recipients = await pool.query("SELECT id FROM users WHERE id<>$1 AND (role_mode='driver' OR role_mode='both')", [req.auth.user_id]);
@@ -1705,7 +1711,7 @@ app.get("/api/duties", requireAuth, async (req, res, next) => {
       to_char(d.created_at AT TIME ZONE 'Asia/Kolkata', 'DD/MM/YYYY HH12:MI AM') AS created_at_ist,
       GREATEST(0, CEIL(300 - EXTRACT(EPOCH FROM (now() - d.created_at))))::int AS free_window_seconds_remaining,
       d.status,d.source_type,
-      (d.user_id=$3) AS is_owner, (d.accepted_by_user_id=$3) AS accepted_by_me, CASE WHEN d.source_type='whatsapp' THEN d.source_poster_name ELSE u.name END AS poster_name, CASE WHEN d.source_type='whatsapp' THEN d.source_poster_phone ELSE u.phone END AS poster_phone, d.source_group AS source_group, d.source_poster_name AS source_poster_name, d.is_featured, u.driver_verification, u.vendor_verification
+      (d.user_id=$3) AS is_owner, (d.accepted_by_user_id=$3) AS accepted_by_me, CASE WHEN d.source_type='whatsapp' THEN d.source_poster_name ELSE u.name END AS poster_name, CASE WHEN d.source_type='whatsapp' THEN d.source_poster_phone ELSE u.phone END AS poster_phone, d.source_poster_name AS source_poster_name, d.is_featured, u.driver_verification, u.vendor_verification
       FROM duties d JOIN users u ON u.id=d.user_id WHERE d.status='open' AND NOT (d.duty_date IS NOT NULL AND d.duty_time IS NOT NULL AND (d.duty_date + d.duty_time) <= (now() AT TIME ZONE 'Asia/Kolkata')) AND ($1='' OR d.pickup_city ILIKE '%'||$1||'%')
       AND ($2='' OR d.drop_city ILIKE '%'||$2||'%')
       AND ($4='' OR d.duty_date::text=$4)
@@ -2024,7 +2030,7 @@ app.get("/api/duties/accepted", requireAuth, async (req, res, next) => {
     const r = await pool.query(
       `SELECT d.id,d.user_id,d.role_posted_as,d.pickup_city,d.pickup_address_private,d.drop_city,d.drop_address_private,
       d.vehicle_type,d.trip_type,d.duty_date,d.duty_time,d.payout_paise,d.notes_private,d.distance_km,d.distance_label,d.created_at,d.status,d.source_type,
-      (d.user_id=$1) AS is_owner, (d.accepted_by_user_id=$1) AS accepted_by_me, CASE WHEN d.source_type='whatsapp' THEN d.source_poster_name ELSE u.name END AS poster_name, CASE WHEN d.source_type='whatsapp' THEN d.source_poster_phone ELSE u.phone END AS poster_phone, d.source_group AS source_group, d.source_poster_name AS source_poster_name
+      (d.user_id=$1) AS is_owner, (d.accepted_by_user_id=$1) AS accepted_by_me, CASE WHEN d.source_type='whatsapp' THEN d.source_poster_name ELSE u.name END AS poster_name, CASE WHEN d.source_type='whatsapp' THEN d.source_poster_phone ELSE u.phone END AS poster_phone, d.source_poster_name AS source_poster_name
       FROM duties d JOIN users u ON u.id=d.user_id WHERE d.accepted_by_user_id=$1 ORDER BY d.is_featured DESC, d.created_at DESC LIMIT 100`,
       [req.auth.user_id]
     );
@@ -2052,7 +2058,7 @@ app.get("/api/duties/mine", requireAuth, async (req, res, next) => {
     await ensureExpiredDutiesBooked();
     await ensureWhatsAppDutySchema();
     const r = await pool.query(
-      `SELECT id,role_posted_as,pickup_city,pickup_address_private,drop_city,drop_address_private,vehicle_type,trip_type,duty_date,duty_time,payout_paise,notes_private,distance_km,distance_label,created_at,status,source_type,source_group,source_poster_name,source_poster_phone,
+      `SELECT id,role_posted_as,pickup_city,pickup_address_private,drop_city,drop_address_private,vehicle_type,trip_type,duty_date,duty_time,payout_paise,notes_private,distance_km,distance_label,created_at,status,source_type,source_poster_name,source_poster_phone,
       (user_id=$1) AS is_owner
       FROM duties WHERE user_id=$1 ORDER BY created_at DESC LIMIT 100`,
       [req.auth.user_id]
