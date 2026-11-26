@@ -1,0 +1,89 @@
+name: API Deployment Smoke Check
+
+on:
+  push:
+    branches: [main]
+    paths:
+      - "src/server.js"
+      - "schema.sql"
+      - ".github/workflows/deployment-smoke.yml"
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  production-smoke:
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    steps:
+      - name: Wait for production API and database
+        shell: bash
+        run: |
+          set -euo pipefail
+          BASE="https://gudiya-taxi-partner-api-1.onrender.com"
+          HEALTH_FILE="$(mktemp)"
+          READY=false
+          for attempt in $(seq 1 36); do
+            if curl --connect-timeout 10 --max-time 20 -fsS "$BASE/health" -o "$HEALTH_FILE"; then
+              if node -e 'const x=require(process.argv[1]); process.exit(x.ok===true ? 0 : 1)' "$HEALTH_FILE"; then
+                READY=true
+                break
+              fi
+            fi
+            echo "API/database not ready yet ($attempt/36)"
+            sleep 10
+          done
+          if [ "$READY" != true ]; then
+            echo "Production API/database did not become healthy within 6 minutes."
+            cat "$HEALTH_FILE" || true
+            exit 1
+          fi
+          echo "Production API and database health check passed."
+
+      - name: Verify Admin app update metadata
+        shell: bash
+        run: |
+          set -euo pipefail
+          BASE="https://gudiya-taxi-partner-api-1.onrender.com"
+          INFO_FILE="$(mktemp)"
+          curl --connect-timeout 10 --max-time 20 -fsS "$BASE/api/admin/app-version" -o "$INFO_FILE"
+          node - "$INFO_FILE" <<'NODE'
+          const fs = require('fs');
+          const info = JSON.parse(fs.readFileSync(process.argv[2], 'utf8'));
+          const version = String(info.latestVersion || '');
+          const apk = String(info.apkUrl || '');
+          const release = String(info.releaseUrl || '');
+          const parts = version.split('.');
+          if (parts.length < 2 || parts.length > 4 ||
+              parts.some(p => !/^\\d+$/.test(p))) {
+            throw new Error('Admin version metadata is missing or invalid');
+          }
+          if (!apk.startsWith('https://github.com/gudiyataxipartner/gudiya-taxi-partner-admin/releases/download/')) {
+            throw new Error('Admin APK URL is not the published GitHub release asset');
+          }
+          if (!apk.endsWith('/Gudiya-Taxi-Partner-Admin-release.apk')) {
+            throw new Error('Admin APK asset filename mismatch');
+          }
+          if (!release.startsWith('https://github.com/gudiyataxipartner/gudiya-taxi-partner-admin/releases/tag/')) {
+            throw new Error('Admin release URL is invalid');
+          }
+          console.log('Admin update metadata passed:', version);
+          console.log('APK asset URL and release URL are valid.');
+          NODE
+
+      - name: Verify UNPAID ALL route is admin-protected (no mutation)
+        shell: bash
+        run: |
+          set -euo pipefail
+          BASE="https://gudiya-taxi-partner-api-1.onrender.com"
+          BODY_FILE="$(mktemp)"
+          STATUS="$(curl --connect-timeout 10 --max-time 20 -sS -o "$BODY_FILE" -w '%{http_code}' \
+            -X POST -H 'Content-Type: application/json' -d '{}' \
+            "$BASE/api/admin/membership/unpaid-all")"
+          if [ "$STATUS" != "403" ]; then
+            echo "Expected unauthenticated admin protection HTTP 403; received $STATUS"
+            cat "$BODY_FILE" || true
+            exit 1
+          fi
+          echo "UNPAID ALL route correctly denies unauthenticated access (HTTP 403); no membership data was changed."
