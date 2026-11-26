@@ -1362,13 +1362,13 @@ app.post("/api/admin/whatsapp-duties/:id/publish", requireAdmin, async(req,res,n
     if (!pickup || !drop || !vehicle || !["one_way","round_trip","local_booking"].includes(trip))
       return res.status(400).json({error:"Pickup, drop, vehicle and an explicitly selected trip type are required"});
     if (dutyDate) {
-      if (!/^20\\d{2}-\\d{2}-\\d{2}$/.test(dutyDate))
+      if (!/^20\d{2}-\d{2}-\d{2}$/.test(dutyDate))
         return res.status(400).json({error:"Duty date must use YYYY-MM-DD format"});
       const dateCheck = new Date(dutyDate + "T00:00:00.000Z");
       if (Number.isNaN(dateCheck.getTime()) || dateCheck.toISOString().slice(0,10) !== dutyDate)
         return res.status(400).json({error:"Duty date is not a valid calendar date"});
     }
-    if (dutyTime && !/^([01]\\d|2[0-3]):[0-5]\\d(?::[0-5]\\d)?$/.test(dutyTime))
+    if (dutyTime && !/^([01]\d|2[0-3]):[0-5]\d(?::[0-5]\d)?$/.test(dutyTime))
       return res.status(400).json({error:"Duty time must use 24-hour format"});
     const payoutText = b.payoutRupees == null ? "" : String(b.payoutRupees).trim();
     const payout = payoutText === "" ? null : Math.round(Number(payoutText) * 100);
