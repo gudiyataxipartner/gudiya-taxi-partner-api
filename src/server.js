@@ -681,16 +681,25 @@ async function ensureWhatsAppInboxSchema() {
   whatsappInboxSchemaReady = true;
 }
 
+async function getLatestMembershipGlobalResetAt() {
+  const result = await pool.query(
+    "SELECT MAX(scheduled_at) AS reset_at FROM membership_global_reset_events WHERE executed_at IS NOT NULL"
+  );
+  return result.rows[0]?.reset_at || null;
+}
+
 async function hasActiveMembership(userId) {
   // One authoritative membership decision for both membership UI and duty details.
-  // An explicit Admin override wins over payment/subscription records.
+  // After the scheduled global reset, only Admin overrides changed after the cutoff are authoritative.
+  const resetAt = await getLatestMembershipGlobalResetAt();
   const override = await pool.query(
     `SELECT lower(trim(status)) AS status
        FROM admin_membership_overrides
       WHERE user_id=$1
+        AND ($2::timestamptz IS NULL OR updated_at > $2::timestamptz)
       ORDER BY updated_at DESC NULLS LAST
       LIMIT 1`,
-    [userId]
+    [userId, resetAt]
   );
   if (override.rowCount) {
     const status = String(override.rows[0].status || "").trim().toLowerCase();
@@ -730,10 +739,11 @@ async function hasActiveMembership(userId) {
         AND lower(trim(status))='approved'
         AND reviewed_at IS NOT NULL
         AND plan_months > 0
+        AND ($2::timestamptz IS NULL OR reviewed_at > $2::timestamptz)
         AND reviewed_at + (plan_months::text || ' months')::interval > now()
       ORDER BY reviewed_at DESC
       LIMIT 1`,
-    [userId]
+    [userId, resetAt]
   );
   return approvedPayment.rowCount > 0;
 }
@@ -3027,7 +3037,109 @@ const schemaCandidates = [ path.join(__dirname, "schema.sql"), path.join(__dirna
       await client.query("SELECT pg_advisory_xact_lock($1)", [741029316]); console.log("Loading database schema from:", schemaPath); const schemaSql = fs.readFileSync(schemaPath, "utf8"); await client.query(schemaSql); await client.query( "ALTER TABLE duties ADD COLUMN IF NOT EXISTS trip_type TEXT NOT NULL DEFAULT 'one_way'" );
       // Set only by the expiry scheduler; applies equally to WhatsApp-imported and manual duties.
       await client.query("ALTER TABLE duties ADD COLUMN IF NOT EXISTS auto_booked_at TIMESTAMPTZ");
-      await client.query("CREATE INDEX IF NOT EXISTS duties_auto_booked_cleanup_idx ON duties(auto_booked_at, id) WHERE auto_booked_at IS NOT NULL"); await client.query( "ALTER TABLE duties DROP CONSTRAINT IF EXISTS duties_trip_type_check" ); await client.query( "ALTER TABLE duties ADD CONSTRAINT duties_trip_type_check CHECK (trip_type IN ('one_way','round_trip','local_booking'))" ); await client.query( "ALTER TABLE users ADD COLUMN IF NOT EXISTS password_hash TEXT" ); await client.query( "ALTER TABLE users ADD COLUMN IF NOT EXISTS referral_code TEXT" ); await client.query( "ALTER TABLE users ADD COLUMN IF NOT EXISTS referred_by_user_id BIGINT REFERENCES users(id) ON DELETE SET NULL" ); await client.query( "ALTER TABLE users ADD COLUMN IF NOT EXISTS first_paid_membership_at TIMESTAMPTZ" ); await client.query( "ALTER TABLE users ADD COLUMN IF NOT EXISTS referral_qualified_at TIMESTAMPTZ" ); await client.query(` UPDATE users SET referral_code='GTP' || upper(substr(md5(id::text || random()::text),1,10)) WHERE referral_code IS NULL `); await client.query( "CREATE UNIQUE INDEX IF NOT EXISTS users_referral_code_unique ON users(referral_code)" ); await client.query(` CREATE TABLE IF NOT EXISTS referral_reward_events ( id BIGSERIAL PRIMARY KEY, referrer_user_id BIGINT NOT NULL REFERENCES users(id) ON DELETE CASCADE, milestone INTEGER NOT NULL CHECK (milestone IN (15,50)), months_awarded INTEGER NOT NULL CHECK (months_awarded IN (1,2)), subscription_id BIGINT REFERENCES subscriptions(id) ON DELETE SET NULL, created_at TIMESTAMPTZ NOT NULL DEFAULT now(), UNIQUE(referrer_user_id,milestone) ) `); await client.query( "ALTER TABLE users ADD COLUMN IF NOT EXISTS vendor_verification TEXT NOT NULL DEFAULT 'not_submitted'" ); await client.query( "ALTER TABLE driver_documents ADD COLUMN IF NOT EXISTS encrypted_payload TEXT" ); await client.query( "ALTER TABLE driver_documents DROP CONSTRAINT IF EXISTS driver_documents_document_type_check" ); await client.query( "ALTER TABLE driver_documents ADD CONSTRAINT driver_documents_document_type_check CHECK (document_type IN ('aadhaar','vendor_aadhaar','driving_licence','vehicle_rc','vendor_gst','vendor_pan'))" ); await client.query(` CREATE TABLE IF NOT EXISTS membership_payment_requests ( id BIGSERIAL PRIMARY KEY, user_id BIGINT NOT NULL REFERENCES users(id) ON DELETE CASCADE, plan_months INTEGER NOT NULL CHECK (plan_months IN (1,3,6)), amount_rupees INTEGER NOT NULL CHECK (amount_rupees IN (51,151,301)), utr VARCHAR(40) NOT NULL UNIQUE, status TEXT NOT NULL DEFAULT 'pending' CHECK (status IN ('pending','approved','rejected')), admin_note TEXT, created_at TIMESTAMPTZ NOT NULL DEFAULT now(), reviewed_at TIMESTAMPTZ, reviewed_by TEXT ) `); await client.query(` CREATE TABLE IF NOT EXISTS admin_membership_overrides ( user_id BIGINT PRIMARY KEY REFERENCES users(id) ON DELETE CASCADE, status TEXT NOT NULL CHECK (status IN ('paid','unpaid')), note TEXT NOT NULL DEFAULT '', updated_at TIMESTAMPTZ NOT NULL DEFAULT now() ) `); await client.query("CREATE TABLE IF NOT EXISTS admin_notifications (id BIGSERIAL PRIMARY KEY, title TEXT NOT NULL, body TEXT NOT NULL, kind TEXT NOT NULL DEFAULT 'info', is_read BOOLEAN NOT NULL DEFAULT false, created_at TIMESTAMPTZ NOT NULL DEFAULT now())"); await client.query("COMMIT"); transactionOpen = false; databaseReady = true; console.log("Database schema initialized successfully. databaseReady=true"); } catch (error) { if (transactionOpen) { try { await client.query("ROLLBACK"); } catch (_) {} } throw error; } finally { client.release(); } } let dutyAutoBookingTimer = null;
+      await client.query("CREATE INDEX IF NOT EXISTS duties_auto_booked_cleanup_idx ON duties(auto_booked_at, id) WHERE auto_booked_at IS NOT NULL"); await client.query( "ALTER TABLE duties DROP CONSTRAINT IF EXISTS duties_trip_type_check" ); await client.query( "ALTER TABLE duties ADD CONSTRAINT duties_trip_type_check CHECK (trip_type IN ('one_way','round_trip','local_booking'))" ); await client.query( "ALTER TABLE users ADD COLUMN IF NOT EXISTS password_hash TEXT" ); await client.query( "ALTER TABLE users ADD COLUMN IF NOT EXISTS referral_code TEXT" ); await client.query( "ALTER TABLE users ADD COLUMN IF NOT EXISTS referred_by_user_id BIGINT REFERENCES users(id) ON DELETE SET NULL" ); await client.query( "ALTER TABLE users ADD COLUMN IF NOT EXISTS first_paid_membership_at TIMESTAMPTZ" ); await client.query( "ALTER TABLE users ADD COLUMN IF NOT EXISTS referral_qualified_at TIMESTAMPTZ" ); await client.query(` UPDATE users SET referral_code='GTP' || upper(substr(md5(id::text || random()::text),1,10)) WHERE referral_code IS NULL `); await client.query( "CREATE UNIQUE INDEX IF NOT EXISTS users_referral_code_unique ON users(referral_code)" ); await client.query(` CREATE TABLE IF NOT EXISTS referral_reward_events ( id BIGSERIAL PRIMARY KEY, referrer_user_id BIGINT NOT NULL REFERENCES users(id) ON DELETE CASCADE, milestone INTEGER NOT NULL CHECK (milestone IN (15,50)), months_awarded INTEGER NOT NULL CHECK (months_awarded IN (1,2)), subscription_id BIGINT REFERENCES subscriptions(id) ON DELETE SET NULL, created_at TIMESTAMPTZ NOT NULL DEFAULT now(), UNIQUE(referrer_user_id,milestone) ) `); await client.query( "ALTER TABLE users ADD COLUMN IF NOT EXISTS vendor_verification TEXT NOT NULL DEFAULT 'not_submitted'" ); await client.query( "ALTER TABLE driver_documents ADD COLUMN IF NOT EXISTS encrypted_payload TEXT" ); await client.query( "ALTER TABLE driver_documents DROP CONSTRAINT IF EXISTS driver_documents_document_type_check" ); await client.query( "ALTER TABLE driver_documents ADD CONSTRAINT driver_documents_document_type_check CHECK (document_type IN ('aadhaar','vendor_aadhaar','driving_licence','vehicle_rc','vendor_gst','vendor_pan'))" ); await client.query(` CREATE TABLE IF NOT EXISTS membership_payment_requests ( id BIGSERIAL PRIMARY KEY, user_id BIGINT NOT NULL REFERENCES users(id) ON DELETE CASCADE, plan_months INTEGER NOT NULL CHECK (plan_months IN (1,3,6)), amount_rupees INTEGER NOT NULL CHECK (amount_rupees IN (51,151,301)), utr VARCHAR(40) NOT NULL UNIQUE, status TEXT NOT NULL DEFAULT 'pending' CHECK (status IN ('pending','approved','rejected')), admin_note TEXT, created_at TIMESTAMPTZ NOT NULL DEFAULT now(), reviewed_at TIMESTAMPTZ, reviewed_by TEXT ) `); await client.query(` CREATE TABLE IF NOT EXISTS admin_membership_overrides ( user_id BIGINT PRIMARY KEY REFERENCES users(id) ON DELETE CASCADE, status TEXT NOT NULL CHECK (status IN ('paid','unpaid')), note TEXT NOT NULL DEFAULT '', updated_at TIMESTAMPTZ NOT NULL DEFAULT now() ) `); await client.query("CREATE TABLE IF NOT EXISTS admin_notifications (id BIGSERIAL PRIMARY KEY, title TEXT NOT NULL, body TEXT NOT NULL, kind TEXT NOT NULL DEFAULT 'info', is_read BOOLEAN NOT NULL DEFAULT false, created_at TIMESTAMPTZ NOT NULL DEFAULT now())");
+      await client.query(`CREATE TABLE IF NOT EXISTS membership_global_reset_events (
+        event_key TEXT PRIMARY KEY,
+        scheduled_at TIMESTAMPTZ NOT NULL,
+        executed_at TIMESTAMPTZ,
+        affected_subscriptions INTEGER NOT NULL DEFAULT 0,
+        affected_overrides INTEGER NOT NULL DEFAULT 0,
+        created_at TIMESTAMPTZ NOT NULL DEFAULT now()
+      )`);
+      await client.query(`INSERT INTO membership_global_reset_events(event_key,scheduled_at)
+        VALUES('all-users-unpaid-2026-11-30-2345-ist','2026-11-30T18:15:00Z'::timestamptz)
+        ON CONFLICT(event_key) DO NOTHING`);
+      await client.query("COMMIT"); transactionOpen = false; databaseReady = true; console.log("Database schema initialized successfully. databaseReady=true"); } catch (error) { if (transactionOpen) { try { await client.query("ROLLBACK"); } catch (_) {} } throw error; } finally { client.release(); } } let membershipGlobalResetTimer = null;
+let membershipGlobalResetInFlight = null;
+
+async function runScheduledMembershipResets() {
+  if (!databaseReady) return 0;
+  if (membershipGlobalResetInFlight) return membershipGlobalResetInFlight;
+  membershipGlobalResetInFlight = (async () => {
+    const client = await pool.connect();
+    try {
+      await client.query("BEGIN");
+      await client.query("SELECT pg_advisory_xact_lock($1)", [741029321]);
+      const due = await client.query(`
+        SELECT event_key,scheduled_at
+        FROM membership_global_reset_events
+        WHERE executed_at IS NULL AND scheduled_at <= now()
+        ORDER BY scheduled_at
+        LIMIT 1
+        FOR UPDATE
+      `);
+      if (!due.rowCount) {
+        await client.query("COMMIT");
+        return 0;
+      }
+      const event = due.rows[0];
+      const scheduledAt = event.scheduled_at;
+      const expiredSubscriptions = await client.query(
+        `UPDATE subscriptions
+           SET status='expired',updated_at=now()
+         WHERE lower(trim(status))='active'
+           AND created_at <= $1
+         RETURNING id`,
+        [scheduledAt]
+      );
+      const unpaidOverrides = await client.query(
+        `UPDATE admin_membership_overrides
+           SET status='unpaid',
+               note=CASE WHEN trim(note)='' THEN 'Automatic all-user unpaid reset: 30 November 2026, 11:45 PM IST'
+                         ELSE left(note || ' | Automatic all-user unpaid reset: 30 November 2026, 11:45 PM IST',500) END,
+               updated_at=now()
+         WHERE status='paid' AND updated_at <= $1
+         RETURNING user_id`,
+        [scheduledAt]
+      );
+      await client.query(
+        `UPDATE membership_global_reset_events
+           SET executed_at=now(),affected_subscriptions=$2,affected_overrides=$3
+         WHERE event_key=$1`,
+        [event.event_key, expiredSubscriptions.rowCount, unpaidOverrides.rowCount]
+      );
+      await client.query(
+        `INSERT INTO audit_log(action,subject_type,subject_id,details)
+         VALUES('global_membership_reset','membership','all-users',$1)`,
+        [JSON.stringify({
+          eventKey:event.event_key,
+          scheduledAt,
+          expiredSubscriptions:expiredSubscriptions.rowCount,
+          unpaidOverrides:unpaidOverrides.rowCount
+        })]
+      );
+      await client.query("COMMIT");
+      console.log("Scheduled all-user membership reset completed:", JSON.stringify({
+        eventKey:event.event_key,
+        scheduledAt,
+        expiredSubscriptions:expiredSubscriptions.rowCount,
+        unpaidOverrides:unpaidOverrides.rowCount
+      }));
+      return 1;
+    } catch (error) {
+      await client.query("ROLLBACK").catch(() => {});
+      console.error("Scheduled all-user membership reset failed:", error.stack || error.message);
+      throw error;
+    } finally {
+      client.release();
+    }
+  })().finally(() => {
+    membershipGlobalResetInFlight = null;
+  });
+  return membershipGlobalResetInFlight;
+}
+
+function startMembershipGlobalResetScheduler() {
+  if (membershipGlobalResetTimer) return;
+  const run = () => runScheduledMembershipResets().catch(error =>
+    console.error("Membership reset scheduler check failed:", error.message)
+  );
+  run();
+  membershipGlobalResetTimer = setInterval(run, 10 * 1000);
+  if (typeof membershipGlobalResetTimer.unref === "function") membershipGlobalResetTimer.unref();
+}
+
+let dutyAutoBookingTimer = null;
 
 async function autoBookExpiredDuties() {
   if (!databaseReady) return 0;
@@ -3146,6 +3258,7 @@ async function startServerWithDatabaseRetry() {
       console.log(`Starting database initialization attempt ${attempt}...`);
       await initializeDatabase();
       startDutyAutoBookingScheduler();
+      startMembershipGlobalResetScheduler();
       console.log("Database initialization completed. API is ready.");
       return;
     } catch (error) {
