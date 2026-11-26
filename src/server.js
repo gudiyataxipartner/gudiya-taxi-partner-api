@@ -2354,6 +2354,7 @@ app.get("/api/admin/referrals", requireAdmin, async (_req, res, next) => {
 
 app.get("/api/admin/dashboard", requireAdmin, async (_req, res, next) => {
   try {
+    await ensureExpiredDutiesBooked();
     const [
       users,
       active,
