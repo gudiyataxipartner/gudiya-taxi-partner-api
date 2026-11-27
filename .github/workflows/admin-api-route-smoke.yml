@@ -87,6 +87,8 @@ jobs:
           set -euo pipefail
           BASE="https://gudiya-taxi-partner-api-1.onrender.com"
           ROUTES=(
+            "/api/admin/analytics"
+            "/api/admin/notifications"
             "/api/admin/activity"
             "/api/admin/security/sessions"
             "/api/admin/backup/export"
