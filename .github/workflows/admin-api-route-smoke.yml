@@ -100,11 +100,12 @@ jobs:
             "/api/vehicles/available/mine"
           )
 
-          for attempt in $(seq 1 60); do
+          for attempt in $(seq 1 6); do
             all_ready=true
             for route in "${ROUTES[@]}"; do
-              status="$(curl --silent --show-error --max-time 12 -o /tmp/admin-route-response.txt -w '%{http_code}' "$BASE$route" || true)"
+              status="$(curl --silent --show-error --max-time 8 -o /tmp/admin-route-response.txt -w '%{http_code}' "$BASE$route" || true)"
               if [[ "$status" != "401" && "$status" != "403" ]]; then
+                echo "Route diagnostic: $route returned HTTP ${status:-000}; body: $(head -c 180 /tmp/admin-route-response.txt 2>/dev/null || true)"
                 echo "Waiting for route $route; unauthenticated HTTP status: ${status:-000}"
                 all_ready=false
                 break
@@ -117,5 +118,5 @@ jobs:
             sleep 10
           done
 
-          echo "Admin route smoke test failed: one or more routes still return 404 or another unexpected status."
+          echo "Admin route smoke test failed after 6 checks: one or more routes still return 404 or another unexpected status."
           exit 1
