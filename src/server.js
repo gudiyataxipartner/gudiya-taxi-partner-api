@@ -2741,7 +2741,7 @@ app.post(
   }
 );
 
-/* GUDIYA TAXI PARTNER ADMIN API ROUTES */
+// GUDIYA TAXI PARTNER ADMIN API ROUTES
 
 app.get("/api/admin/referrals", requireAdmin, async (_req, res, next) => {
   try {
