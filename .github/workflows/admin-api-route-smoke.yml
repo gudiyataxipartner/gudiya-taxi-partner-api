@@ -51,6 +51,29 @@ jobs:
               }
             }
             inspect(ast);
+            function inspectTargetRoutes(node, parents=[]) {
+              if (node.type === 'CallExpression' &&
+                  node.callee && node.callee.type === 'MemberExpression' &&
+                  node.callee.object && node.callee.object.name === 'app' &&
+                  node.callee.property && node.callee.property.name === 'get' &&
+                  node.arguments && node.arguments[0] && node.arguments[0].type === 'Literal' &&
+                  ['/api/admin/analytics','/api/admin/notifications'].includes(node.arguments[0].value)) {
+                console.log('TARGET ROUTE REGISTRATION:', node.arguments[0].value,
+                  'line', node.loc.start.line,
+                  'ancestors', JSON.stringify(parents.map(p => ({
+                    type:p.type,
+                    name:p.id && p.id.name || p.key && p.key.name || '',
+                    line:p.loc && p.loc.start.line
+                  }))));
+              }
+              for (const [key,value] of Object.entries(node)) {
+                if (key === 'loc' || key === 'start' || key === 'end') continue;
+                if (Array.isArray(value)) {
+                  for (const child of value) if (child && typeof child.type === 'string') inspectTargetRoutes(child,[...parents,node]);
+                } else if (value && typeof value.type === 'string') inspectTargetRoutes(value,[...parents,node]);
+              }
+            }
+            inspectTargetRoutes(ast);
             console.log('Acorn parse passed.');
           } catch (error) {
             console.error('Backend parse error:', error.message, error.loc || '');
