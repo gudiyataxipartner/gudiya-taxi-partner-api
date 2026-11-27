@@ -2803,7 +2803,7 @@ app.get("/api/admin/users", requireAdmin, async (req, res, next) => {
     const q = String(req.query.q || "")
       .trim()
       .slice(0, 100);
-    const membership = ["all", "paid", "unpaid"].includes(
+    const membership = ["all", "paid", "unpaid", "manually_paid"].includes(
       String(req.query.membership || "all")
     )
       ? String(req.query.membership || "all")
@@ -2850,9 +2850,31 @@ app.get("/api/admin/users", requireAdmin, async (req, res, next) => {
       FROM users u LEFT JOIN admin_membership_overrides o ON o.user_id=u.id
       WHERE ($1::text='' OR u.name::text ILIKE '%'||$1::text||'%' OR u.phone::text ILIKE '%'||$1::text||'%' OR u.id::text=$1::text)
         AND ($2::text='all' OR u.role_mode::text=$2::text)
-        AND ($3::text='all' OR (CASE WHEN o.status IS NOT NULL THEN o.status::text
-          WHEN EXISTS(SELECT 1 FROM subscriptions s WHERE s.user_id=u.id AND s.status='active'
-            AND s.current_period_end>now() AND (s.provider='referral_reward' OR s.provider='admin_extension' OR (s.provider='manual_upi' AND s.provider_payment_id IS NOT NULL))) THEN 'paid' ELSE 'unpaid' END)::text=$3::text)
+        AND (
+          $3::text='all'
+          OR (
+            CASE
+              WHEN lower(trim(o.status::text))='unpaid' THEN 'unpaid'
+              WHEN lower(trim(o.status::text))='paid' THEN 'manually_paid'
+              WHEN EXISTS(
+                SELECT 1 FROM subscriptions m
+                WHERE m.user_id=u.id
+                  AND lower(trim(m.status))='active'
+                  AND m.current_period_end>now()
+                  AND m.provider='admin_extension'
+              ) THEN 'manually_paid'
+              WHEN EXISTS(
+                SELECT 1 FROM subscriptions p
+                WHERE p.user_id=u.id
+                  AND lower(trim(p.status))='active'
+                  AND p.current_period_end>now()
+                  AND (p.provider='referral_reward'
+                    OR (p.provider='manual_upi' AND p.provider_payment_id IS NOT NULL))
+              ) THEN 'paid'
+              ELSE 'unpaid'
+            END
+          )::text=$3::text
+        )
         AND ($4::text='all' OR (CASE WHEN EXISTS(SELECT 1 FROM device_sessions ds WHERE ds.user_id=u.id
           AND ds.revoked_at IS NULL AND ds.last_seen_at>now()-interval '30 days') THEN 'active' ELSE 'inactive' END)::text=$4::text)
         AND ($5::text='all' OR u.driver_verification::text=$5::text OR u.vendor_verification::text=$5::text)
