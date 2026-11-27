@@ -2830,7 +2830,18 @@ app.get("/api/admin/users", requireAdmin, async (req, res, next) => {
     const result = await pool.query(
       `
       SELECT u.id,u.name,u.phone,u.role_mode,u.driver_verification,u.vendor_verification,u.created_at,
-        o.status AS admin_override_status,
+        CASE
+          WHEN o.status IS NOT NULL THEN o.status
+          WHEN EXISTS (
+            SELECT 1
+            FROM subscriptions manual_membership
+            WHERE manual_membership.user_id=u.id
+              AND lower(trim(manual_membership.status))='active'
+              AND manual_membership.current_period_end>now()
+              AND manual_membership.provider='admin_extension'
+          ) THEN 'paid'
+          ELSE NULL
+        END AS admin_override_status,
         CASE WHEN o.status IS NOT NULL THEN o.status
           WHEN EXISTS(SELECT 1 FROM subscriptions s WHERE s.user_id=u.id AND s.status='active'
             AND s.current_period_end>now() AND (s.provider='referral_reward' OR s.provider='admin_extension' OR (s.provider='manual_upi' AND s.provider_payment_id IS NOT NULL))) THEN 'paid' ELSE 'unpaid' END AS membership_status,
@@ -3009,6 +3020,17 @@ app.get("/api/admin/users/:id", requireAdmin, async (req, res, next) => {
       `
       SELECT u.id, u.name, u.phone, u.role_mode,
         u.driver_verification, u.vendor_verification, u.created_at,
+        CASE
+          WHEN o.status IS NOT NULL THEN o.status
+          WHEN EXISTS (
+            SELECT 1 FROM subscriptions manual_membership
+            WHERE manual_membership.user_id=u.id
+              AND lower(trim(manual_membership.status))='active'
+              AND manual_membership.current_period_end>now()
+              AND manual_membership.provider='admin_extension'
+          ) THEN 'paid'
+          ELSE NULL
+        END AS admin_override_status,
         COALESCE(o.status, CASE WHEN EXISTS (
           SELECT 1 FROM subscriptions s
           WHERE s.user_id=u.id
