@@ -538,45 +538,6 @@ function requireAdmin(req, res, next) {
   next();
 }
 
-// Dashboard compatibility endpoints. Keep these at top-level directly after requireAdmin
-// so the Android Admin app always sees the routes before any other Admin route handlers.
-app.get("/api/admin/analytics", requireAdmin, async (_req, res, next) => {
-  try {
-    const periods = await pool.query(`
-      SELECT period,
-        (SELECT COUNT(*)::int FROM users u WHERE u.created_at >= now() - p.period_window) AS registrations,
-        (SELECT COUNT(*)::int FROM duties d WHERE d.created_at >= now() - p.period_window) AS duties_posted,
-        (SELECT COUNT(*)::int FROM duties d WHERE d.created_at >= now() - p.period_window AND d.status IN ('booked','accepted','completed')) AS duties_booked,
-        (SELECT COUNT(*)::int FROM membership_payment_requests m WHERE m.created_at >= now() - p.period_window AND m.status = 'approved') AS payments_approved,
-        (SELECT COUNT(*)::int FROM membership_payment_requests m WHERE m.created_at >= now() - p.period_window AND m.status = 'pending') AS payments_pending
-      FROM (VALUES ('today', interval '1 day'), ('7_days', interval '7 days'), ('30_days', interval '30 days')) p(period, period_window)
-    `);
-    const summary = await pool.query(`
-      SELECT
-        (SELECT COUNT(*)::int FROM driver_documents WHERE status='pending') AS pending_verifications,
-        (SELECT COUNT(*)::int FROM membership_payment_requests WHERE status='pending') AS pending_payments,
-        (SELECT COUNT(*)::int FROM duties WHERE status='open') AS open_duties,
-        (SELECT COUNT(*)::int FROM users WHERE created_at >= now()-interval '1 day') AS new_users_today
-    `);
-    res.set("Cache-Control", "no-store");
-    res.json({ periods: periods.rows, summary: summary.rows[0] || {} });
-  } catch (error) {
-    next(error);
-  }
-});
-
-app.get("/api/admin/notifications", requireAdmin, async (_req, res, next) => {
-  try {
-    const result = await pool.query(
-      "SELECT id,title,body,kind,is_read,created_at FROM admin_notifications ORDER BY created_at DESC LIMIT 100"
-    );
-    res.set("Cache-Control", "no-store");
-    res.json({ notifications: result.rows });
-  } catch (error) {
-    next(error);
-  }
-});
-
 // Stable Admin reporting routes, registered immediately after authentication.
 function adminCsvCell(value) {
   const text = String(value == null ? "" : value);
