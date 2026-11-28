@@ -1945,7 +1945,7 @@ app.post("/api/duties/:id/accept", requireAuth, async (req, res, next) => {
         .status(403)
         .json({ error: "ड्यूटी स्वीकार करने के लिए ड्राइवर अकाउंट जरूरी है" });
     await ensureExpiredDutiesBooked();
-    // Enforce the same membership/five-minute access policy on the server.
+    // Enforce the same membership/10-minute access policy on the server.
     // Hiding the Accept button in the app alone is not a security boundary.
     const activeMembership = await hasActiveMembership(req.auth.user_id);
     const client = await pool.connect();
@@ -1954,7 +1954,7 @@ app.post("/api/duties/:id/accept", requireAuth, async (req, res, next) => {
       const found = await client.query(
         `SELECT id,user_id,status,source_type,duty_date,duty_time,
           (duty_date IS NOT NULL AND duty_time IS NOT NULL AND (duty_date + duty_time) <= (now() AT TIME ZONE 'Asia/Kolkata')) AS is_expired,
-          GREATEST(0, CEIL(300 - EXTRACT(EPOCH FROM (now() - created_at))))::int AS free_window_seconds_remaining
+          GREATEST(0, CEIL(600 - EXTRACT(EPOCH FROM (now() - created_at))))::int AS free_window_seconds_remaining
          FROM duties WHERE id=$1 FOR UPDATE`,
         [id]
       );
@@ -1989,7 +1989,7 @@ app.post("/api/duties/:id/accept", requireAuth, async (req, res, next) => {
       if (!activeMembership && Number(duty.free_window_seconds_remaining || 0) > 0) {
         await client.query("ROLLBACK");
         return res.status(403).json({
-          error: "यह ड्यूटी स्वीकार करने के लिए पहले पाँच मिनट पूरे होने चाहिए या सक्रिय सदस्यता जरूरी है।",
+          error: "यह ड्यूटी स्वीकार करने के लिए पहले दस मिनट पूरे होने चाहिए या सक्रिय सदस्यता जरूरी है।",
         });
       }
       const updated = await client.query(
