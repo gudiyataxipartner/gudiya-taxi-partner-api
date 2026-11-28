@@ -1730,6 +1730,23 @@ app.delete("/api/vehicles/available/:id", requireAuth, async (req, res, next) =>
   }
 });
 
+function getGudiyaAppMessages() {
+  let parsed = {};
+  try {
+    const value = JSON.parse(process.env.GUDIYA_APP_MESSAGES_JSON || "{}");
+    if (value && typeof value === "object" && !Array.isArray(value)) parsed = value;
+  } catch (error) {
+    console.error("Invalid GUDIYA_APP_MESSAGES_JSON:", error.message);
+  }
+  const clean = (value, max = 500) =>
+    typeof value === "string" ? value.replace(/[\\u0000-\\u0008\\u000B\\u000C\\u000E-\\u001F]/g, "").trim().slice(0, max) : "";
+  return {
+    unpaidDutyLock: clean(parsed.unpaidDutyLock, 500),
+    announcement: clean(parsed.announcement, 500),
+    announcementVersion: clean(parsed.announcementVersion, 80),
+  };
+}
+
 app.get("/api/duties", requireAuth, async (req, res, next) => {
   try {
     await ensureExpiredDutiesBooked();
@@ -1812,6 +1829,8 @@ app.get("/api/duties", requireAuth, async (req, res, next) => {
       membershipDecisionSource: active ? "server_verified_membership" : "free_window_or_unpaid",
       privateDetailsRule:
         "duty owner always sees full details; subscribers see full details immediately; other non-subscribers see full details after the first 10 minutes",
+      // Remote UI messages can be updated from Render without releasing a new APK.
+      appMessages: getGudiyaAppMessages(),
     });
   } catch (e) {
     next(e);
