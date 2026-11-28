@@ -861,14 +861,14 @@ function extractIndianMobile(value) {
 function normalizeWhatsAppMessageForDedup(value) {
   return String(value || "")
     .normalize("NFKC")
-    .replace(/[\\u200B-\\u200D\\uFEFF]/g, "")
+    .replace(/[\u200B-\u200D\uFEFF]/g, "")
     .toLocaleLowerCase("en-IN")
-    .replace(/\\s+/g, " ")
+    .replace(/\s+/g, " ")
     .trim();
 }
 function createWhatsAppSourceMessageHash(message, contactPhone) {
   const normalizedMessage = normalizeWhatsAppMessageForDedup(message);
-  const normalizedPhone = String(contactPhone || "").replace(/\\D/g, "").slice(-10);
+  const normalizedPhone = String(contactPhone || "").replace(/\D/g, "").slice(-10);
   return crypto.createHash("sha256")
     .update("gudiya-whatsapp-duty|" + normalizedMessage + "|" + normalizedPhone)
     .digest("hex");
@@ -878,16 +878,15 @@ function createWhatsAppSourceMessageHash(message, contactPhone) {
 // auto-import and the Admin publish endpoint, even when they contain a route.
 function isWhatsAppAvailableVehicleMessage(value) {
   const message = normalizeWhatsAppMessageForDedup(value);
-  const vehicleWords = /\\b(?:vehicle|car|cab|taxi|gaadi|gadi|innova|crysta|ertiga|dzire|swift|sedan|hatchback|suv|tempo|traveller|bus|tavera|xylo)\\b|गाड़ी|गाड़ी|गाडी|वाहन|कार|टैक्सी/i;
-  const availabilityWords = /\\b(?:available|availability|free|vacant|empty)\\b|उपलब्ध|खाली|फ्री/i;
+  const vehicleWords = /\b(?:vehicle|car|cab|taxi|gaadi|gadi|innova|crysta|ertiga|dzire|swift|sedan|hatchback|suv|tempo|traveller|bus|tavera|xylo)\b|गाड़ी|गाड़ी|गाडी|वाहन|कार|टैक्सी/i;
+  const availabilityWords = /\b(?:available|availability|free|vacant|empty)\b|उपलब्ध|खाली|फ्री/i;
   const clearAvailabilityPhrase =
-    /\\b(?:available|availability|free|vacant|empty)\\b.{0,55}\\b(?:vehicle|car|cab|taxi|gaadi|gadi|innova|crysta|ertiga|dzire|swift|sedan|hatchback|suv|tempo|traveller|bus|tavera|xylo)\\b/i.test(message) ||
-    /\\b(?:vehicle|car|cab|taxi|gaadi|gadi|innova|crysta|ertiga|dzire|swift|sedan|hatchback|suv|tempo|traveller|bus|tavera|xylo)\\b.{0,55}\\b(?:available|availability|free|vacant|empty)\\b/i.test(message) ||
+    /\b(?:available|availability|free|vacant|empty)\b.{0,55}\b(?:vehicle|car|cab|taxi|gaadi|gadi|innova|crysta|ertiga|dzire|swift|sedan|hatchback|suv|tempo|traveller|bus|tavera|xylo)\b/i.test(message) ||
+    /\b(?:vehicle|car|cab|taxi|gaadi|gadi|innova|crysta|ertiga|dzire|swift|sedan|hatchback|suv|tempo|traveller|bus|tavera|xylo)\b.{0,55}\b(?:available|availability|free|vacant|empty)\b/i.test(message) ||
     /(?:गाड़ी|गाड़ी|गाडी|वाहन|कार|टैक्सी).{0,24}(?:उपलब्ध|खाली|फ्री)|(?:उपलब्ध|खाली|फ्री).{0,24}(?:गाड़ी|गाड़ी|गाडी|वाहन|कार|टैक्सी)/i.test(message);
-  const explicitDemand = /\\b(?:need|needed|required|requirement|looking for|wanted|booking required)\\b|चाहिए|जरूरत|आवश्यकता|आवश्यक/i.test(message);
+  const explicitDemand = /\b(?:need|needed|required|requirement|looking for|wanted|booking required)\b|चाहिए|जरूरत|आवश्यकता|आवश्यक/i.test(message);
   return vehicleWords.test(message) && availabilityWords.test(message) && clearAvailabilityPhrase && !explicitDemand;
 }
-
 function cleanWhatsAppPosterName(value) {
   let name = String(value || "").trim();
   if (!name) return null;
@@ -1406,7 +1405,7 @@ app.post("/api/admin/whatsapp-duties", requireAdmin, async (req, res, next) => {
     const initialStatus = isAvailableVehicle ? "ignored" : "pending";
     const result = await pool.query(`INSERT INTO admin_whatsapp_duties(group_name,sender_name,sender_phone,message_text,message_hash,status)
       VALUES($1,$2,$3,$4,$5,$6) ON CONFLICT(message_hash) DO NOTHING RETURNING id,status`,
-      [groupName,senderName||null,/^[6-9]\\d{9}$/.test(senderPhone)?senderPhone:null,message,hash,initialStatus]);
+      [groupName,senderName||null,/^[6-9]\d{9}$/.test(senderPhone)?senderPhone:null,message,hash,initialStatus]);
     return res.status(201).json({ok:true,duplicate:!result.rowCount,ignored:isAvailableVehicle,item:result.rows[0]||null});
   } catch(e) { next(e); }
 });
