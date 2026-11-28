@@ -1758,7 +1758,7 @@ app.get("/api/duties", requireAuth, async (req, res, next) => {
       `SELECT d.id,d.user_id,d.role_posted_as,d.pickup_city,d.pickup_address_private,d.drop_city,d.drop_address_private,d.vehicle_type,d.trip_type,
       d.duty_date,d.duty_time,d.payout_paise,d.notes_private,d.distance_km,d.distance_label,d.created_at,
       to_char(d.created_at AT TIME ZONE 'Asia/Kolkata', 'DD/MM/YYYY HH12:MI AM') AS created_at_ist,
-      GREATEST(0, CEIL(300 - EXTRACT(EPOCH FROM (now() - d.created_at))))::int AS free_window_seconds_remaining,
+      GREATEST(0, CEIL(600 - EXTRACT(EPOCH FROM (now() - d.created_at))))::int AS free_window_seconds_remaining,
       d.status,d.source_type,
       (d.user_id=$3) AS is_owner, (d.accepted_by_user_id=$3) AS accepted_by_me, CASE WHEN d.source_type='whatsapp' THEN d.source_poster_name ELSE u.name END AS poster_name, CASE WHEN d.source_type='whatsapp' THEN d.source_poster_phone ELSE u.phone END AS poster_phone, d.source_poster_name AS source_poster_name, d.is_featured, u.driver_verification, u.vendor_verification
       FROM duties d JOIN users u ON u.id=d.user_id WHERE d.status='open' AND NOT (d.duty_date IS NOT NULL AND d.duty_time IS NOT NULL AND (d.duty_date + d.duty_time) <= (now() AT TIME ZONE 'Asia/Kolkata')) AND ($1='' OR d.pickup_city ILIKE '%'||$1||'%')
@@ -1770,14 +1770,14 @@ app.get("/api/duties", requireAuth, async (req, res, next) => {
     );
     const active = await hasActiveMembership(req.auth.user_id);
     const duties = r.rows.map((d) => {
-      // Use PostgreSQL's clock for the 5-minute window so it cannot drift
+      // Use PostgreSQL's clock for the 10-minute window so it cannot drift
       // when the Render Node clock and database clock differ.
       const secondsRemaining = Math.max(
         0,
         Number(d.free_window_seconds_remaining ?? 0)
       );
       // The person who posted a duty always sees its full details, regardless of membership.
-      // Other subscribers see full details immediately; other non-subscribers unlock them after five minutes.
+      // Other subscribers see full details immediately; other non-subscribers unlock them after ten minutes.
       // Compare IDs as strings too, so the duty poster is never locked by a boolean/type mismatch.
       const isOwner = d.is_owner === true || String(d.user_id) === String(req.auth.user_id);
       const isImporter = d.source_type === "whatsapp" && String(d.user_id) === String(req.auth.user_id);
@@ -1811,7 +1811,7 @@ app.get("/api/duties", requireAuth, async (req, res, next) => {
       membershipActive: active,
       membershipDecisionSource: active ? "server_verified_membership" : "free_window_or_unpaid",
       privateDetailsRule:
-        "duty owner always sees full details; subscribers see full details immediately; other non-subscribers see full details after the first 5 minutes",
+        "duty owner always sees full details; subscribers see full details immediately; other non-subscribers see full details after the first 10 minutes",
     });
   } catch (e) {
     next(e);
