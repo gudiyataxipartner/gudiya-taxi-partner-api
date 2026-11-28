@@ -854,6 +854,40 @@ function extractIndianMobile(value) {
   return null;
 }
 
+
+// One stable WhatsApp identity shared by inbox publishing and direct duty imports.
+// Group and notification sender are deliberately excluded: forwarding the same
+// duty to multiple groups must not create multiple public duty posts.
+function normalizeWhatsAppMessageForDedup(value) {
+  return String(value || "")
+    .normalize("NFKC")
+    .replace(/[\\u200B-\\u200D\\uFEFF]/g, "")
+    .toLocaleLowerCase("en-IN")
+    .replace(/\\s+/g, " ")
+    .trim();
+}
+function createWhatsAppSourceMessageHash(message, contactPhone) {
+  const normalizedMessage = normalizeWhatsAppMessageForDedup(message);
+  const normalizedPhone = String(contactPhone || "").replace(/\\D/g, "").slice(-10);
+  return crypto.createHash("sha256")
+    .update("gudiya-whatsapp-duty|" + normalizedMessage + "|" + normalizedPhone)
+    .digest("hex");
+}
+
+// Availability advertisements are not duty requests. Keep these out of both
+// auto-import and the Admin publish endpoint, even when they contain a route.
+function isWhatsAppAvailableVehicleMessage(value) {
+  const message = normalizeWhatsAppMessageForDedup(value);
+  const vehicleWords = /\\b(?:vehicle|car|cab|taxi|gaadi|gadi|innova|crysta|ertiga|dzire|swift|sedan|hatchback|suv|tempo|traveller|bus|tavera|xylo)\\b|गाड़ी|गाड़ी|गाडी|वाहन|कार|टैक्सी/i;
+  const availabilityWords = /\\b(?:available|availability|free|vacant|empty)\\b|उपलब्ध|खाली|फ्री/i;
+  const clearAvailabilityPhrase =
+    /\\b(?:available|availability|free|vacant|empty)\\b.{0,55}\\b(?:vehicle|car|cab|taxi|gaadi|gadi|innova|crysta|ertiga|dzire|swift|sedan|hatchback|suv|tempo|traveller|bus|tavera|xylo)\\b/i.test(message) ||
+    /\\b(?:vehicle|car|cab|taxi|gaadi|gadi|innova|crysta|ertiga|dzire|swift|sedan|hatchback|suv|tempo|traveller|bus|tavera|xylo)\\b.{0,55}\\b(?:available|availability|free|vacant|empty)\\b/i.test(message) ||
+    /(?:गाड़ी|गाड़ी|गाडी|वाहन|कार|टैक्सी).{0,24}(?:उपलब्ध|खाली|फ्री)|(?:उपलब्ध|खाली|फ्री).{0,24}(?:गाड़ी|गाड़ी|गाडी|वाहन|कार|टैक्सी)/i.test(message);
+  const explicitDemand = /\\b(?:need|needed|required|requirement|looking for|wanted|booking required)\\b|चाहिए|जरूरत|आवश्यकता|आवश्यक/i.test(message);
+  return vehicleWords.test(message) && availabilityWords.test(message) && clearAvailabilityPhrase && !explicitDemand;
+}
+
 function cleanWhatsAppPosterName(value) {
   let name = String(value || "").trim();
   if (!name) return null;
@@ -1366,11 +1400,14 @@ app.post("/api/admin/whatsapp-duties", requireAdmin, async (req, res, next) => {
     const senderPhone = String(req.body.senderPhone || "").replace(/\D/g,"").slice(-10);
     const message = String(req.body.message || req.body.messageText || "").trim().slice(0,5000);
     if (!groupName || !message) return res.status(400).json({error:"WhatsApp group and message are required"});
-    const hash = crypto.createHash("sha256").update([groupName.toLowerCase(),senderName.toLowerCase(),senderPhone,message.toLowerCase().replace(/\s+/g," ").trim()].join("|")).digest("hex");
-    const result = await pool.query(`INSERT INTO admin_whatsapp_duties(group_name,sender_name,sender_phone,message_text,message_hash)
-      VALUES($1,$2,$3,$4,$5) ON CONFLICT(message_hash) DO NOTHING RETURNING id,status`,
-      [groupName,senderName||null,/^[6-9]\d{9}$/.test(senderPhone)?senderPhone:null,message,hash]);
-    return res.status(201).json({ok:true,duplicate:!result.rowCount,item:result.rows[0]||null});
+    const contactPhone = extractIndianMobile(message) || extractIndianMobile(senderPhone);
+    const hash = createWhatsAppSourceMessageHash(message, contactPhone || senderPhone);
+    const isAvailableVehicle = isWhatsAppAvailableVehicleMessage(message);
+    const initialStatus = isAvailableVehicle ? "ignored" : "pending";
+    const result = await pool.query(`INSERT INTO admin_whatsapp_duties(group_name,sender_name,sender_phone,message_text,message_hash,status)
+      VALUES($1,$2,$3,$4,$5,$6) ON CONFLICT(message_hash) DO NOTHING RETURNING id,status`,
+      [groupName,senderName||null,/^[6-9]\\d{9}$/.test(senderPhone)?senderPhone:null,message,hash,initialStatus]);
+    return res.status(201).json({ok:true,duplicate:!result.rowCount,ignored:isAvailableVehicle,item:result.rows[0]||null});
   } catch(e) { next(e); }
 });
 app.get("/api/admin/whatsapp-duties", requireAdmin, async (req,res,next) => {
@@ -1432,6 +1469,12 @@ app.post("/api/admin/whatsapp-duties/:id/publish", requireAdmin, async(req,res,n
       await client.query("ROLLBACK"); transactionOpen = false;
       return res.status(404).json({error:"Pending WhatsApp duty not found"});
     }
+    if (isWhatsAppAvailableVehicleMessage(inbox.rows[0].message_text)) {
+      await client.query("UPDATE admin_whatsapp_duties SET status='ignored',reviewed_at=now() WHERE id=$1",[id]);
+      await client.query("COMMIT"); transactionOpen = false;
+      client.release(); client = null;
+      return res.json({ok:true,ignored:true,reason:"Available vehicle information is not a duty and was not published"});
+    }
     // Either the message's listed contact number OR the WhatsApp sender's
     // mobile number is acceptable as the duty contact number.
     // The admin-reviewed number takes precedence; all sources are normalized and validated.
@@ -1451,9 +1494,22 @@ app.post("/api/admin/whatsapp-duties/:id/publish", requireAdmin, async(req,res,n
       await client.query("ROLLBACK"); transactionOpen = false;
       return res.status(409).json({error:"WHATSAPP_VENDOR_PHONE does not match exactly one Vendor/Both account"});
     }
-    const duty = await client.query(`INSERT INTO duties(user_id,role_posted_as,pickup_city,drop_city,vehicle_type,trip_type,duty_date,duty_time,payout_paise,notes_private,distance_label,source_type,source_group,source_poster_name,source_poster_phone)
-      VALUES($1,'vendor',$2,$3,$4,$5,$6,$7,$8,$9,'लगभग दूरी','whatsapp',NULL,$10,$11) RETURNING id`,
-      [vendor.rows[0].id,pickup,drop,vehicle,trip,dutyDate || null,dutyTime || null,payout,String(inbox.rows[0].message_text).slice(0,1000),getWhatsAppPosterName(inbox.rows[0].sender_name,inbox.rows[0].group_name),contactPhone]);
+    const sourceMessageHash = createWhatsAppSourceMessageHash(inbox.rows[0].message_text, contactPhone);
+    const duty = await client.query(`INSERT INTO duties(user_id,role_posted_as,pickup_city,drop_city,vehicle_type,trip_type,duty_date,duty_time,payout_paise,notes_private,distance_label,source_type,source_group,source_poster_name,source_poster_phone,source_message_hash)
+      VALUES($1,'vendor',$2,$3,$4,$5,$6,$7,$8,$9,'लगभग दूरी','whatsapp',NULL,$10,$11,$12)
+      ON CONFLICT (source_message_hash) WHERE source_message_hash IS NOT NULL DO NOTHING RETURNING id`,
+      [vendor.rows[0].id,pickup,drop,vehicle,trip,dutyDate || null,dutyTime || null,payout,String(inbox.rows[0].message_text).slice(0,1000),getWhatsAppPosterName(inbox.rows[0].sender_name,inbox.rows[0].group_name),contactPhone,sourceMessageHash]);
+    if (!duty.rowCount) {
+      const existingDuty = await client.query("SELECT id FROM duties WHERE source_message_hash=$1 LIMIT 1",[sourceMessageHash]);
+      if (!existingDuty.rowCount) throw new Error("WhatsApp duplicate was detected but its existing duty could not be located");
+      const existingDutyId = existingDuty.rows[0].id;
+      await client.query("UPDATE admin_whatsapp_duties SET status='published',duty_id=$2,reviewed_at=now() WHERE id=$1",[id,existingDutyId]);
+      await client.query("INSERT INTO audit_log(action,subject_type,subject_id,details) VALUES('whatsapp_duty_duplicate_skipped','duty',$1,$2)",
+        [String(existingDutyId),JSON.stringify({inboxId:id,admin:req.admin?.username || "admin"})]);
+      await client.query("COMMIT"); transactionOpen = false;
+      client.release(); client = null;
+      return res.json({ok:true,duplicate:true,dutyId:existingDutyId});
+    }
     await client.query("UPDATE admin_whatsapp_duties SET status='published',duty_id=$2,reviewed_at=now() WHERE id=$1",[id,duty.rows[0].id]);
     await client.query("INSERT INTO audit_log(action,subject_type,subject_id,details) VALUES('whatsapp_duty_published','duty',$1,$2)",
       [String(duty.rows[0].id),JSON.stringify({inboxId:id,admin:req.admin?.username || "admin"})]);
@@ -1483,6 +1539,9 @@ app.post("/api/duties/import/whatsapp", requireAuth, async (req, res, next) => {
     const contactPhone =
       extractIndianMobile(message) || extractIndianMobile(req.body.senderPhone);
     if (!groupName || !message) return res.status(400).json({ error: "WhatsApp group and message are required" });
+    if (isWhatsAppAvailableVehicleMessage(message)) {
+      return res.json({ ok:true, ignored:true, reason:"Available vehicle information is not a duty and was not published" });
+    }
     if (!contactPhone) return res.status(422).json({ ignored: true, reason: "Duty contact mobile number is missing; duty was not published" });
     // Ignore messages that do not look like a duty. Parsing is intentionally conservative.
     const routeLine = message.split(/\r?\n/).map(line => line.trim()).find(line => /\bto\b|से|→|➜/i.test(line));
@@ -1519,7 +1578,7 @@ app.post("/api/duties/import/whatsapp", requireAuth, async (req, res, next) => {
     const timeMatch = message.match(/\b(\d{1,2}):(\d{2})\s*(AM|PM)?\b/i);
     let dutyTime = null;
     if(timeMatch){let h=Number(timeMatch[1]),m=Number(timeMatch[2]);const ap=(timeMatch[3]||"").toUpperCase();if(m<60&&h<=12){if(ap==="PM"&&h<12)h+=12;if(ap==="AM"&&h===12)h=0;dutyTime=`${String(h).padStart(2,"0")}:${String(m).padStart(2,"0")}:00`;}}
-    const hash = crypto.createHash("sha256").update(`${groupName.toLowerCase()}|${senderName.toLowerCase()}|${message.toLowerCase().replace(/\s+/g," ").trim()}`).digest("hex");
+    const hash = createWhatsAppSourceMessageHash(message, contactPhone);
     const inserted = await pool.query(`INSERT INTO duties(user_id,role_posted_as,pickup_city,drop_city,vehicle_type,trip_type,duty_date,duty_time,payout_paise,notes_private,distance_label,source_type,source_group,source_poster_name,source_poster_phone,source_message_hash)
       VALUES($1,'vendor',$2,$3,$4,$5,$6,$7,$8,$9,'लगभग दूरी','whatsapp',NULL,$10,$11,$12)
       ON CONFLICT (source_message_hash) WHERE source_message_hash IS NOT NULL DO NOTHING RETURNING id,created_at,status`,
